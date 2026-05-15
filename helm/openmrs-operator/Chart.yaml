@@ -1,0 +1,19 @@
+apiVersion: v2
+name: openmrs-operator
+description: >
+  Cluster-scoped operators for OpenMRS (MariaDB, Elasticsearch, etc.).
+  Install this chart once per cluster before deploying the OpenMRS app chart.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+
+dependencies:
+  - name: mariadb-operator-crds
+    version: 26.3.0
+    repository: https://helm.mariadb.com/mariadb-operator
+    condition: mariadb-operator-crds.enabled
+
+  - name: mariadb-operator
+    version: 26.3.0
+    repository: https://helm.mariadb.com/mariadb-operator
+    condition: mariadb-operator.enabled

@@ -1,0 +1,24 @@
+OpenMRS Operators installed successfully in namespace {{ .Release.Namespace }}.
+
+Enabled operators:
+{{- if hasKey .Values "mariadb-operator" }}
+{{- if index .Values "mariadb-operator" "enabled" | default false }}
+  mariadb-operator v26.3.0  (namespace: {{ .Release.Namespace }})
+{{- end }}
+{{- end }}
+
+Next step — deploy the OpenMRS application stack:
+
+  Using Makefile (recommended):
+    make deploy-openmrs
+
+  Manually:
+    helm dependency update ./helm/openmrs
+    helm upgrade --install --create-namespace \
+      -n openmrs \
+      --values ./helm/kind-openmrs.yaml \
+      openmrs ./helm/openmrs
+
+To verify operators are running:
+  kubectl -n {{ .Release.Namespace }} get pods
+  kubectl get crds | grep mariadb

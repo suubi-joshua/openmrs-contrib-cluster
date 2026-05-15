@@ -1,0 +1,7 @@
+mariadb-operator-crds:
+  enabled: true
+
+mariadb-operator:
+  enabled: true
+  crds:
+    enabled: false
