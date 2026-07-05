@@ -5,6 +5,12 @@ tenant:
 global:
   defaultStorageClass: "gp2"
 
+shared:
+  db:
+    hostname: ""            # Full FQDN of shared MariaDB (e.g. openmrs-backend-mariadb.openmrs.svc.cluster.local)
+    port: 3306
+    rootPassword: ""        # Root password, copied from parent chart's mariadb.auth.rootPassword
+
 imagePullSecrets: []
 
 backend:
@@ -82,6 +88,10 @@ backend:
     user: ""
     password: ""
     url: ""
+    maxConnections: 50
+    maxQueriesPerHour: 100000
+    maxUpdatesPerHour: 50000
+    maxConnectionsPerHour: 500
 
   infinispan:
     clustered: false

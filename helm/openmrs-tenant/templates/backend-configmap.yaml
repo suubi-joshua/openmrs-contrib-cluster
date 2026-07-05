@@ -20,3 +20,5 @@ data:
   cache.type: "local"
   {{- end }}
   storage.type: "local"
+  OMRS_CREATE_TABLES: "true"
+  OMRS_AUTO_UPDATE_DATABASE: "true"
