@@ -11,5 +11,11 @@ dependencies:
 - name: traefik
   repository: https://traefik.github.io/charts
   version: 34.0.0
-digest: sha256:028474bfd05c8e79f9ad7eff0cb22e002cc4f5e2a60dcd93718125d31d1cfa58
-generated: "2026-06-23T15:57:31.342120473+03:00"
+- name: metrics-server
+  repository: https://kubernetes-sigs.github.io/metrics-server
+  version: 3.14.0
+- name: cluster-autoscaler
+  repository: https://kubernetes.github.io/autoscaler
+  version: 9.43.3
+digest: sha256:4d8b3e5758d9d85cc2f935c6be67bf7f78236252c33d359011ba036cacbadc23
+generated: "2026-09-06T19:49:48.612283709+03:00"

@@ -14,8 +14,20 @@ mysql_time_zone                 = "US/Eastern"
 enable_bastion_host             = false
 bastion_public_access_cidr      = "0.0.0.0/0"
 enable_ses                      = false
-eks_version                     = "1.31"
-eks_node_instance_type          = "t3.medium"
-eks_desired_num_of_nodes        = 3
-eks_min_num_of_nodes            = 3
-eks_max_num_of_nodes            = 6
+# Bumping the minor? Also bump the cluster-autoscaler chart in
+# helm/openmrs-operator/Chart.yaml so CA matches the cluster's K8s minor.
+eks_version            = "1.31"
+eks_node_instance_type = "t3.medium"
+# Create-time only - Cluster Autoscaler owns desired_size afterwards (lifecycle
+# ignore_changes in modules/eks/cluster.tf); editing this later is a no-op.
+eks_desired_num_of_nodes = 3
+# Kept at 3 on purpose: this env runs the in-cluster 3-replica Galera MariaDB
+# (enable_rds=false + umbrella galera=true), so the floor must not drop below the
+# replica count. At 2 nodes the 3 Galera pods pack 2-on-one and an involuntary node
+# failure takes write quorum with it (the mariadb-operator auto-creates an HA PDB,
+# but that only guards voluntary disruption). Lower to 2 ONLY after the DB leaves the
+# scaling node group - move it to RDS (enable_rds=true), or add one-per-node pod
+# anti-affinity (affinity.antiAffinityEnabled on the MariaDB CR). Until then a CA
+# scale-DOWN test belongs on an RDS-backed env, not here.
+eks_min_num_of_nodes = 3
+eks_max_num_of_nodes = 6

@@ -124,7 +124,7 @@ seaweedfs:
     dataDirs:
       - name: data
         type: "persistentVolumeClaim"
-        storageClass: "standard"
+        storageClass: "gp2"
         size: "8Gi"
         maxVolumes: 0
   filer:

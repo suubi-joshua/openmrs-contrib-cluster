@@ -36,6 +36,18 @@ resource "aws_eks_node_group" "openmrs-node_group" {
     min_size     = var.min_num_of_nodes
   }
 
+  # No Cluster Autoscaler auto-discovery tags are set here on purpose: EKS
+  # automatically applies them (k8s.io/cluster-autoscaler/enabled and
+  # /<cluster>=owned) to a managed node group's underlying Auto Scaling Group,
+  # which is where CA looks. aws_eks_node_group.tags would only tag the node
+  # group resource (they do not propagate to the ASG), so setting them here
+  # would be dead config. CA scales within scaling_config's min_size..max_size.
+
+  # CA sets desired_size out-of-band; don't let `terraform apply` reset it.
+  lifecycle {
+    ignore_changes = [scaling_config[0].desired_size]
+  }
+
   depends_on = [
     aws_iam_role_policy_attachment.cluster_AmazonEBSCSIDriverPolicy
   ]

@@ -116,3 +116,109 @@ resource "aws_iam_role_policy_attachment" "cluster_EKSServicePolicy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSServicePolicy"
   role       = aws_iam_role.cluster-role.name
 }
+
+## IAM Role + IRSA for the Cluster Autoscaler (least privilege).
+# The CA pod's ServiceAccount is annotated with this role's ARN so it calls AWS
+# APIs via IRSA, without static keys.
+resource "aws_iam_role" "cluster_autoscaler" {
+  name               = "openmrs-cluster-autoscaler-${var.environment}"
+  assume_role_policy = data.aws_iam_policy_document.cluster_autoscaler_assume_role.json
+
+  tags = {
+    Name  = "openmrs-cluster-autoscaler-${var.environment}"
+    owner = var.owner
+  }
+}
+
+data "aws_iam_policy_document" "cluster_autoscaler_assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+    }
+
+    actions = [
+      "sts:AssumeRoleWithWebIdentity",
+    ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "${aws_iam_openid_connect_provider.eks.url}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    # The ServiceAccount is the chart-rendered one: the operator chart release
+    # name prefixed to the CA subchart name. helm/openmrs-operator/values.yaml
+    # sets clusterAutoscaler.nameOverride=cluster-autoscaler (the default
+    # alias-derived name, "aws-clusterAutoscaler", is mixed-case and rejected
+    # by the Kubernetes API on real deploys -- confirmed live), so the
+    # rendered name is provider-agnostic: "cluster-autoscaler", not
+    # "aws-clusterAutoscaler". Keep in sync with the operator's release name +
+    # namespace used in helm/scripts/bootstrap.sh.
+    condition {
+      test     = "StringEquals"
+      variable = "${aws_iam_openid_connect_provider.eks.url}:sub"
+      values   = ["system:serviceaccount:${var.operator_namespace}:openmrs-operator-cluster-autoscaler"]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "cluster_autoscaler" {
+  # Read-only discovery/inspection. These actions don't support resource-level
+  # ARNs (Resource: "*") and can't mutate anything. Scoped to what CA 1.31.0
+  # (the app version behind chart 9.43.3) actually calls: ASG tag discovery runs
+  # through DescribeAutoScalingGroups with tag filters (NOT autoscaling:DescribeTags,
+  # which CA 1.31.0 never calls); DescribeScalingActivities lets CA detect an
+  # unfulfillable scale-up and back off instead of waiting out
+  # --max-node-provision-time; ec2:DescribeInstanceTypes builds node templates from
+  # the live API instead of the bundled static list. ec2:DescribeImages and
+  # ec2:GetInstanceTypesFromInstanceRequirements are in AWS's documented policy but
+  # unused here (the node group passes plain instance_types, not requirements).
+  statement {
+    effect = "Allow"
+    actions = [
+      "autoscaling:DescribeAutoScalingGroups",
+      "autoscaling:DescribeLaunchConfigurations",
+      "autoscaling:DescribeScalingActivities",
+      "ec2:DescribeInstanceTypes",
+      "ec2:DescribeLaunchTemplateVersions",
+    ]
+    resources = ["*"] # tfsec:ignore:aws-iam-no-policy-wildcards
+  }
+
+  # Mutating actions. Auto Scaling APIs don't accept ASG ARNs, so least privilege
+  # is enforced by the ResourceTag condition below (only CA-owned node groups).
+  statement {
+    effect = "Allow"
+    actions = [
+      "autoscaling:SetDesiredCapacity",
+      "autoscaling:TerminateInstanceInAutoScalingGroup",
+    ]
+    resources = ["*"] # tfsec:ignore:aws-iam-no-policy-wildcards
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/k8s.io/cluster-autoscaler/${aws_eks_cluster.openmrs-cluster.name}"
+      values   = ["owned"]
+    }
+  }
+
+  # eks:DescribeNodegroup lets CA read a managed node group's labels/taints when
+  # scaling it up from zero (the only EKS API CA calls; discovery itself is via
+  # the autoscaling tags above). Read-only, no resource-level scoping in AWS's
+  # documented CA policy.
+  statement {
+    effect = "Allow"
+    actions = [
+      "eks:DescribeNodegroup",
+    ]
+    resources = ["*"] # tfsec:ignore:aws-iam-no-policy-wildcards
+  }
+}
+
+resource "aws_iam_role_policy" "cluster_autoscaler" {
+  name   = "openmrs-cluster-autoscaler-policy-${var.environment}"
+  role   = aws_iam_role.cluster_autoscaler.name
+  policy = data.aws_iam_policy_document.cluster_autoscaler.json
+}

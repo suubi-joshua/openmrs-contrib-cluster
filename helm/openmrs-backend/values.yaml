@@ -54,6 +54,11 @@ imagePullSecrets: []
 persistence:
   enabled: true
   size: 8Gi
+  # whenScaled "" -> Delete under autoscaling (scale-in drops the claim), Retain
+  # otherwise so a single-replica scale-to-0 keeps its data. Retain on uninstall.
+  retentionPolicy:
+    whenScaled: ""
+    whenDeleted: Retain
 
 serviceAccount:
   # Specifies whether a service account should be created
@@ -154,9 +159,36 @@ startupProbe:
 autoscaling:
   enabled: false
   minReplicas: 1
-  maxReplicas: 100
+  # Near node-group capacity (a pod requests 1000m/2Gi ≈ one per node), so exhaustion
+  # shows as HPA ScalingLimited rather than a Pending pod.
+  maxReplicas: 5
   targetCPUUtilizationPercentage: 80
-  targetMemoryUtilizationPercentage: 80
+  # Off (like the frontend): heap sizes off the limit, HPA measures the request, and
+  # heap doesn't track load - a memory target stalls the HPA more than it helps.
+  # targetMemoryUtilizationPercentage: 80
+  # Longer scale-down window: the 300s default is short vs this backend's slow boot.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 900
+
+# Caps how many backend pods a voluntary disruption (node drain / CA scale-in)
+# may take down at once. A PDB is rendered whenever the backend can run >1
+# replica. maxUnavailable (not minAvailable) so a single-replica backend can
+# still be drained for node maintenance/scale-in - minAvailable:1 would pin the
+# sole pod and block the drain entirely.
+podDisruptionBudget:
+  maxUnavailable: 1
+
+statefulset:
+  # topologyKey for the soft pod anti-affinity that spreads replicas across nodes.
+  topology:
+    spread: kubernetes.io/hostname
+
+# Pod scheduling affinity. Empty {} keeps the chart's default soft pod
+# anti-affinity (spread replicas across nodes, preferred not required). Set this
+# to override entirely - e.g. node affinity to pin backends to a pool, or
+# requiredDuringScheduling anti-affinity for hard one-per-node placement.
+affinity: {}
 
 seaweedfs:
   enabled: false
@@ -172,6 +204,12 @@ seaweedfs:
         - localhost
   # Must match the umbrella's top-level seaweedfs.s3.credentials.admin.*.
   s3:
+    # Empty = this release's own in-cluster SeaweedFS; a tenant sharing the primary's
+    # points here (e.g. http://openmrs-seaweedfs-s3.openmrs.svc.cluster.local:8333).
+    endpoint: ""
+    # Shared across releases under admin creds - tenants sharing one SeaweedFS MUST
+    # each set a distinct, pre-created bucket or they overwrite each other's files.
+    bucketName: "openmrs"
     credentials:
       admin:
         accessKey: "openmrs"

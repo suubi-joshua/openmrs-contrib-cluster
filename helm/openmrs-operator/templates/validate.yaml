@@ -1,0 +1,28 @@
+{{- /*
+Fail fast: clusterAutoscaler needs BOTH a cloudProvider AND a discovery target the
+provider actually reads. autoscalingGroups works on any provider (--nodes is emitted
+before the provider switch). autoDiscovery.clusterName is only read by aws/azure/magnum/
+clusterapi; autoDiscovery.namespace/labels only by clusterapi. On other providers those
+satisfy the chart's render gate but the pod comes up with no node-group argument (a
+silent no-op), so they do not count as a target there.
+*/}}
+{{- $ca := .Values.clusterAutoscaler -}}
+{{- $hasDiscovery := $ca.autoscalingGroups -}}
+{{- if has $ca.cloudProvider (list "aws" "azure" "magnum" "clusterapi") -}}
+{{- $hasDiscovery = or $hasDiscovery $ca.autoDiscovery.clusterName -}}
+{{- end -}}
+{{- if eq $ca.cloudProvider "clusterapi" -}}
+{{- $hasDiscovery = or $hasDiscovery $ca.autoDiscovery.namespace $ca.autoDiscovery.labels -}}
+{{- end -}}
+{{- if and $ca.enabled (or (not $ca.cloudProvider) (not $hasDiscovery)) -}}
+{{- fail "openmrs-operator: clusterAutoscaler.enabled=true requires BOTH clusterAutoscaler.cloudProvider AND a discovery target the provider actually reads: clusterAutoscaler.autoscalingGroups (any provider), clusterAutoscaler.autoDiscovery.clusterName (aws/azure/magnum/clusterapi), or autoDiscovery.namespace/labels (clusterapi only). Without both, the Cluster Autoscaler Deployment either does not render or renders with no node group at all. See the README \"Scaling\" section." -}}
+{{- end -}}
+{{- /*
+On AWS also require an explicit awsRegion. The upstream chart defaults it to
+us-east-1 and emits AWS_REGION on the CA pod, which suppresses the webhook's
+region injection - CA then discovers ASGs in the wrong region and silently
+no-ops. Same silent-no-op class as the discovery-target check above.
+*/}}
+{{- if and $ca.enabled (eq $ca.cloudProvider "aws") (not $ca.awsRegion) -}}
+{{- fail "openmrs-operator: clusterAutoscaler.cloudProvider=aws also requires clusterAutoscaler.awsRegion (e.g. us-east-2, matching terraform/main.tf). Otherwise the upstream chart hardcodes AWS_REGION=us-east-1 on the CA pod and it manages ASGs in the wrong region - a silent no-op. See the README \"Scaling\" section." -}}
+{{- end -}}

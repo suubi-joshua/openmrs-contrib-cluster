@@ -1,0 +1,22 @@
+{{- /*
+Fail fast: running >1 backend replica (autoscaling.enabled or replicaCount > 1)
+needs state shared across pods. Without it, replicas serve stale second-level
+cache reads and store uploads on per-pod ReadWriteOnce disk invisible to other
+pods - sticky routing pins a user to one pod but does not share files or cache.
+Requires infinispan.clustered (JGroups-synced cache) and seaweedfs.enabled
+(shared S3 object storage).
+*/}}
+{{- if or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1) -}}
+{{- $missing := list -}}
+{{- if not .Values.infinispan.clustered -}}{{- $missing = append $missing "infinispan.clustered=true (JGroups-synced L2 cache)" -}}{{- end -}}
+{{- if not .Values.seaweedfs.enabled -}}{{- $missing = append $missing "seaweedfs.enabled=true (shared S3 object storage)" -}}{{- end -}}
+{{- if $missing -}}
+{{/* seaweedfs.enabled only writes the S3 client config; it deploys nothing. On the
+umbrella the endpoint defaults to the release's own SeaweedFS, but a tenant deploys
+none of its own - so a tenant must also point seaweedfs.s3.endpoint at the primary's,
+or it satisfies this guard with storage aimed at a non-existent service. */}}
+{{- $hint := "" -}}
+{{- if not .Values.seaweedfs.enabled -}}{{- $hint = " (For a tenant sharing the primary's SeaweedFS, also set seaweedfs.s3.endpoint to the primary's S3 AND a distinct, pre-created seaweedfs.s3.bucketName - all releases otherwise share the 'openmrs' bucket under admin creds and would read/overwrite each other's files.)" -}}{{- end -}}
+{{- fail (printf "openmrs-backend: running multiple replicas (autoscaling.enabled or replicaCount>1) also requires %s. Without them replicas disagree on cached state and stored files.%s See the README \"Scaling\" section." (join " and " $missing) $hint) -}}
+{{- end -}}
+{{- end -}}

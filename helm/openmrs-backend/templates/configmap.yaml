@@ -50,7 +50,10 @@ data:
   {{- if .Values.seaweedfs.enabled }}
   storage.type: "s3"
   storage.s3.region: "us-east-2"
-  storage.s3.endpoint: {{ include "openmrs-seaweedfs.s3url" . }}
+  # endpoint/bucket overridable per release; a tenant sharing SeaweedFS needs its own
+  # bucket (see values.yaml seaweedfs.s3).
+  storage.s3.endpoint: {{ .Values.seaweedfs.s3.endpoint | default (include "openmrs-seaweedfs.s3url" .) }}
+  storage.s3.bucketName: {{ .Values.seaweedfs.s3.bucketName | default "openmrs" | quote }}
   storage.s3.forcePathStyle: "true"
   {{- end }}
   {{- if .Values.infinispan.clustered }}

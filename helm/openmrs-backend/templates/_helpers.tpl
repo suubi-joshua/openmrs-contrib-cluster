@@ -96,6 +96,15 @@ Headless Service name used for JGroups DNS_PING discovery.
 {{- end }}
 
 {{/*
+True when the backend can run >1 replica (traefikService.enabled, multi-replica,
+or autoscaling on) and therefore needs sticky routing + a PDB.
+Emits "" not "false" when off, since a non-empty string is truthy in {{ if }}.
+*/}}
+{{- define "openmrs-backend.needsSticky" -}}
+{{- if (or .Values.traefikService.enabled (gt (int .Values.replicaCount) 1) .Values.autoscaling.enabled) }}true{{- end -}}
+{{- end }}
+
+{{/*
 OpenMRS database name: global.mariadb.auth.database when embedded (matches the operator-created DB, single-sourced with whoever deploys it), else db.database; falls back to "openmrs".
 */}}
 {{- define "openmrs-backend.dbName" -}}

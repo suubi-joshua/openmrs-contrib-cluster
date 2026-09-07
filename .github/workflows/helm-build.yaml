@@ -24,6 +24,8 @@ jobs:
         run: |
           helm repo add grafana https://grafana.github.io/helm-charts
           helm repo add elastic https://helm.elastic.co
+          helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server
+          helm repo add autoscaler https://kubernetes.github.io/autoscaler
           helm repo update
 
       - name: Lint Subcharts
@@ -31,16 +33,17 @@ jobs:
           helm lint helm/openmrs-backend
           helm lint helm/openmrs-frontend
 
-      - name: Update Subchart Dependencies
-        run: |
-          helm dependency update helm/openmrs-backend
-          helm dependency update helm/openmrs-frontend
-
       - name: Update Dependencies
         run: helm dependency update helm/openmrs
 
       - name: Update Tenant Dependencies
         run: helm dependency update helm/openmrs-tenant
+
+      - name: Update Operator Dependencies
+        run: helm dependency update helm/openmrs-operator
+
+      - name: Lint Operator Chart
+        run: helm lint helm/openmrs-operator
 
       - name: Lint Main Chart
         run: helm lint helm/openmrs
@@ -53,6 +56,9 @@ jobs:
           helm template helm/openmrs --generate-name > /tmp/default.yaml
           grep -q 'OMRS_DB_URL: "jdbc:mariadb:loadbalance://release-name-mariadb.default.svc.cluster.local:3306/openmrs?autoReconnect=true&sessionVariables=default_storage_engine=InnoDB&useUnicode=true&characterEncoding=UTF-8&useMysqlMetadata=true"' /tmp/default.yaml
           grep -q 'OMRS_DB_NAME: "openmrs"' /tmp/default.yaml
+          # Non-autoscaling default keeps its PVC on scale-to-0 - pins the Retain side
+          # of the retention ternary so it can't be flattened to a plain Delete.
+          grep -q 'whenScaled: Retain' /tmp/default.yaml
 
       - name: Validate Rendering (full-featured)
         run: |
@@ -100,6 +106,137 @@ jobs:
             echo "expected db.url with no db.hostname to be rejected"; exit 1
           fi
           grep -qF 'db.hostname is required alongside db.url' <<<"$err"
+
+      - name: "Validate Rendering (operator default: metrics-server ON, autoscaler OFF)"
+        run: |
+          helm dependency update helm/openmrs-operator
+          helm template helm/openmrs-operator --generate-name > /tmp/operator-default.yaml
+          # Metrics Server on by default, Cluster Autoscaler off.
+          grep -q 'app.kubernetes.io/name: metrics-server' /tmp/operator-default.yaml
+          if grep -qi 'cluster-autoscaler' /tmp/operator-default.yaml; then
+            echo "cluster-autoscaler must be off by default"; exit 1
+          fi
+
+      - name: "Validate Rendering (operator: autoscaler ON for AWS + metrics-server OFF)"
+        run: |
+          # Real release name (not --generate-name): the ServiceAccount name must
+          # match what terraform/modules/eks/iam.tf's IRSA trust policy expects.
+          helm template openmrs-operator ./helm/openmrs-operator \
+            --set clusterAutoscaler.enabled=true \
+            --set clusterAutoscaler.cloudProvider=aws \
+            --set clusterAutoscaler.awsRegion=us-east-2 \
+            --set clusterAutoscaler.autoDiscovery.clusterName=openmrs-cluster-nonprod \
+            --set metrics-server.enabled=false > /tmp/operator-aws.yaml
+          # Must render the nameOverride-fixed lowercase name (the raw alias name
+          # is mixed-case and rejected by the API on a real install).
+          if ! grep -q 'openmrs-operator-cluster-autoscaler' /tmp/operator-aws.yaml; then
+            echo "cluster-autoscaler subchart must render with the nameOverride-fixed name when enabled"; exit 1
+          fi
+          grep -q 'openmrs-cluster-nonprod' /tmp/operator-aws.yaml
+          # The awsRegion we passed must reach the pod (guards against the chart's
+          # us-east-1 default silently taking over - CA would scan the wrong region).
+          if ! grep -q 'us-east-2' /tmp/operator-aws.yaml; then
+            echo "awsRegion must render onto the CA pod (AWS_REGION), not the chart's us-east-1 default"; exit 1
+          fi
+          if grep -q 'us-east-1' /tmp/operator-aws.yaml; then
+            echo "chart's default AWS_REGION=us-east-1 leaked through"; exit 1
+          fi
+          if grep -q 'app.kubernetes.io/name: metrics-server' /tmp/operator-aws.yaml; then
+            echo "metrics-server must be disableable"; exit 1
+          fi
+
+      - name: "Validate Rendering (operator CA guard: rejects enable without a discovery target)"
+        run: |
+          # CA enabled with a cloudProvider but no autoDiscovery.clusterName must
+          # fail the render. The upstream CA Deployment gates on autoDiscovery/
+          # autoscalingGroups (not cloudProvider), so this combo would otherwise
+          # create RBAC + the IRSA ServiceAccount but no autoscaler pod - a silent
+          # no-op. The guard (helm/openmrs-operator/templates/validate.yaml) blocks it.
+          if err=$(helm template openmrs-operator ./helm/openmrs-operator \
+              --set clusterAutoscaler.enabled=true \
+              --set clusterAutoscaler.cloudProvider=aws \
+              --set clusterAutoscaler.awsRegion=us-east-2 2>&1); then
+            echo "expected render to fail: CA enabled with a provider but no autoDiscovery target"; exit 1
+          fi
+          grep -qF 'requires BOTH' <<<"$err"
+
+      - name: "Validate Rendering (operator CA guard: rejects aws without awsRegion)"
+        run: |
+          # cloudProvider=aws without awsRegion must fail: the upstream chart
+          # otherwise pins AWS_REGION=us-east-1 on the CA pod and it scans the wrong
+          # region - a silent no-op. The guard requires an explicit region on AWS.
+          if err=$(helm template openmrs-operator ./helm/openmrs-operator \
+              --set clusterAutoscaler.enabled=true \
+              --set clusterAutoscaler.cloudProvider=aws \
+              --set clusterAutoscaler.autoDiscovery.clusterName=openmrs-cluster-nonprod 2>&1); then
+            echo "expected render to fail: CA on aws without awsRegion"; exit 1
+          fi
+          grep -qF 'requires clusterAutoscaler.awsRegion' <<<"$err"
+
+      - name: "Validate Rendering (operator CA guard: aws rejects clusterapi-only discovery fields)"
+        run: |
+          # autoDiscovery.namespace/labels satisfy the upstream render gate but only
+          # reach the CA container on cloudProvider=clusterapi; on aws they yield a pod
+          # with no --node-group argument (a silent no-op). The guard must reject them
+          # on aws, while still accepting them on clusterapi.
+          if err=$(helm template openmrs-operator ./helm/openmrs-operator \
+              --set clusterAutoscaler.enabled=true \
+              --set clusterAutoscaler.cloudProvider=aws \
+              --set clusterAutoscaler.awsRegion=us-east-2 \
+              --set clusterAutoscaler.autoDiscovery.namespace=kube-system 2>&1); then
+            echo "expected render to fail: aws with only a clusterapi-scoped discovery field"; exit 1
+          fi
+          grep -qF 'requires BOTH' <<<"$err"
+
+      - name: "Validate Rendering (operator CA guard: rejects a discovery target the provider does not read)"
+        run: |
+          # autoDiscovery.clusterName is only read by aws/azure/magnum/clusterapi. On gce
+          # (and hetzner/oci) the pod comes up with no node-group argument, so clusterName
+          # alone must not satisfy the guard there; autoscalingGroups is the universal one.
+          if err=$(helm template openmrs-operator ./helm/openmrs-operator \
+              --set clusterAutoscaler.enabled=true \
+              --set clusterAutoscaler.cloudProvider=gce \
+              --set clusterAutoscaler.autoDiscovery.clusterName=openmrs-cluster-nonprod 2>&1); then
+            echo "expected render to fail: gce with only clusterName (gce does not read it)"; exit 1
+          fi
+          grep -qF 'requires BOTH' <<<"$err"
+
+      - name: "Validate Rendering (backend: all-digit seaweedfs bucket stays a string)"
+        run: |
+          # ConfigMap.data must be map[string]string; an all-digit bucket name would
+          # render as a YAML integer and be rejected by the API server without | quote.
+          helm template helm/openmrs-backend --generate-name \
+            --set seaweedfs.enabled=true --set seaweedfs.s3.bucketName=12345 \
+            | grep -q 'storage.s3.bucketName: "12345"'
+
+      - name: "Validate Rendering (backend autoscaling: HPA StatefulSet + sticky route)"
+        run: |
+          # Multi-replica needs clustered cache + shared storage (enforced by the guard).
+          helm template helm/openmrs-backend --generate-name \
+            --set autoscaling.enabled=true \
+            --set infinispan.clustered=true \
+            --set seaweedfs.enabled=true > /tmp/backend-autoscaling.yaml
+          # HPA targets the StatefulSet (not a Deployment).
+          grep -A4 'scaleTargetRef' /tmp/backend-autoscaling.yaml | grep -q 'kind: StatefulSet'
+          # Sticky routing engages under autoscaling: the HTTPRoute must route THROUGH
+          # the sticky TraefikService (checking the backendRef, not just that the
+          # TraefikService resource exists). gateway.enabled already defaults to true.
+          grep -A4 'backendRefs' /tmp/backend-autoscaling.yaml | grep -q 'kind: TraefikService'
+          # PDB renders whenever the backend can scale above 1, using maxUnavailable
+          # so a single-replica backend stays drainable (node maintenance / CA scale-in).
+          grep -q 'kind: PodDisruptionBudget' /tmp/backend-autoscaling.yaml
+          grep -q 'maxUnavailable:' /tmp/backend-autoscaling.yaml
+          # Under autoscaling the PVC retention flips to Delete (scale-in drops the claim).
+          grep -q 'whenScaled: Delete' /tmp/backend-autoscaling.yaml
+
+      - name: "Validate Rendering (backend autoscaling guard: rejects multi-replica without shared state)"
+        run: |
+          # Autoscaling without clustered cache + shared storage must fail the render.
+          if err=$(helm template helm/openmrs-backend --generate-name \
+              --set autoscaling.enabled=true 2>&1); then
+            echo "expected render to fail without infinispan.clustered + seaweedfs.enabled"; exit 1
+          fi
+          grep -qF 'running multiple replicas' <<<"$err"
 
       - name: Validate Rendering (MariaDB replication mode)
         run: |

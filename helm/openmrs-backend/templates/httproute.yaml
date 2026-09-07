@@ -20,7 +20,7 @@ spec:
             type: PathPrefix
             value: {{ .Values.gateway.path | default "/openmrs/" }}
       backendRefs:
-        {{- if or .Values.traefikService.enabled (gt (int .Values.replicaCount) 1) }}
+        {{- if include "openmrs-backend.needsSticky" . }}
         - group: traefik.io
           kind: TraefikService
           name: {{ include "openmrs-backend.fullname" . }}-sticky

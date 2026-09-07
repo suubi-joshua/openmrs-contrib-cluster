@@ -42,3 +42,31 @@ traefik:
     - key: node-role.kubernetes.io/control-plane
       operator: Exists
       effect: NoSchedule
+
+metrics-server:
+  # On by default so HPA metrics resolve on Kind/EKS/bare-helm. Disable if the
+  # cluster already runs the EKS-managed add-on. (--kubelet-insecure-tls for
+  # Kind is set in bootstrap.sh, not here, so real clouds keep TLS verification.)
+  enabled: true
+
+clusterAutoscaler:
+  enabled: false
+  # Forces a valid, all-lowercase name: the camelCase alias would otherwise
+  # render "<release>-<cloudProvider>-clusterAutoscaler", which the API rejects
+  # (RFC 1123). fullnameOverride alone won't fix the container name/label.
+  nameOverride: cluster-autoscaler
+  # No default provider: the upstream chart assumes aws unless set. Implementers
+  # choose per cloud, e.g. --set clusterAutoscaler.cloudProvider=aws (the provider
+  # validated here). azure/gce/magnum/clusterapi also work upstream but need
+  # provider-specific values (e.g. magnum needs cloudConfigPath).
+  cloudProvider: ""
+  # Cleared for the same reason: the upstream chart defaults awsRegion to
+  # us-east-1, so leaving it renders AWS_REGION=us-east-1 on every cluster and
+  # stops the EKS pod-identity/IRSA webhook injecting the real one - CA then
+  # manages ASGs in the wrong region and silently no-ops. Set it per install to
+  # the cluster's region (this repo's cluster is us-east-2, terraform/main.tf).
+  awsRegion: ""
+  autoDiscovery:
+    # Match value for tag-based discovery; on EKS this is the cluster name. EKS
+    # auto-applies the CA discovery tags to the node group's ASG.
+    clusterName: ""

@@ -92,7 +92,8 @@ else
   helm upgrade --install openmrs-operator "$HELM_DIR/openmrs-operator" \
     --namespace "$OPENMRS_OPERATOR_NS" \
     --wait \
-    --timeout 10m0s
+    --timeout 10m0s \
+    --set metrics-server.args[0]=--kubelet-insecure-tls
 
   info "Waiting for components to become ready..."
 
@@ -126,6 +127,16 @@ else
 
   wait_deployment "$OPENMRS_OPERATOR_NS" openmrs-operator-traefik
   success "Traefik ready."
+
+  # Only wait if metrics-server was actually deployed (metrics-server.enabled,
+  # on by default). If it's disabled the release still succeeds, so don't block
+  # on a deployment that was never created.
+  if kubectl get deployment openmrs-operator-metrics-server -n "$OPENMRS_OPERATOR_NS" &>/dev/null; then
+    wait_deployment "$OPENMRS_OPERATOR_NS" openmrs-operator-metrics-server
+    success "Metrics Server ready (HPA Resource metrics will resolve)."
+  else
+    info "Metrics Server disabled (metrics-server.enabled=false) — skipping wait; HPA needs metrics from elsewhere."
+  fi
   show_pods "$OPENMRS_OPERATOR_NS"
 fi
 end_step

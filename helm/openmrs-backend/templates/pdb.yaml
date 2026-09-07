@@ -1,0 +1,16 @@
+{{/* Rendered whenever the backend can run >1 replica (multi-replica or HPA), so a
+node drain / CA scale-in can't take the whole backend down. */}}
+{{- if include "openmrs-backend.needsSticky" . }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "openmrs-backend.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openmrs-backend.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "openmrs-backend.selectorLabels" . | nindent 6 }}
+{{- end }}

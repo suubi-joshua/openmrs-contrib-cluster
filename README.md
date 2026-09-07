@@ -58,7 +58,7 @@ This handles all of the following in order (idempotent — safe to re-run):
 | 1a   | Preflight checks — verifies `kind`, `kubectl`, `helm`, Docker |
 | 1b   | Pre-pulls images + Helm dependencies in parallel |
 | 2    | Creates Kind cluster (`kind-config.yaml`) + loads images |
-| 3    | Installs `openmrs-operator` chart — bundles Gateway API CRDs, MariaDB operator, ECK operator, Traefik, and local-path-provisioner |
+| 3    | Installs `openmrs-operator` chart - bundles Gateway API CRDs, MariaDB operator, ECK operator, Traefik, Metrics Server, and Cluster Autoscaler (opt-in) |
 | 4    | Deploys OpenMRS umbrella chart (live pod status every 10s) |
 | 5    | Prints pod summaries and access URL |
 
@@ -76,6 +76,87 @@ With the default `kind-openmrs.yaml`, the following dashboards are accessible ou
 No port-forwarding needed — Traefik binds the port directly. Default credentials: Grafana `admin` / `Admin123`, SeaweedFS Admin `admin` / `Admin123`.
 
 To disable monitoring (Grafana, Loki, Alloy), set `monitoring.enabled=false` in `kind-openmrs.yaml` or pass `--set monitoring.enabled=false` to `helm`.
+
+### Scaling
+
+Horizontal scaling has two layers:
+
+- **Pod level (HPA)** - the backend HPA (`openmrs-backend.autoscaling.enabled`) targets
+  the backend StatefulSet. Metrics Server (installed by the `openmrs-operator` chart,
+  `metrics-server.enabled`, on by default) provides the CPU/memory `Resource` metrics.
+  When autoscaling is on, sticky (session-affine) routing engages automatically so
+  scale-out never drops `openmrs_session` cookies, and a PodDisruptionBudget guards
+  voluntary disruptions once running more than one replica.
+
+  > **Prerequisite for correct multi-replica behaviour:** replicas must share
+  > second-level cache and object storage. Sticky routing only pins a user to one
+  > pod; it does not share cache or files across pods. Without both, replicas serve
+  > stale cached reads and store uploads on per-pod local disk invisible to other
+  > pods. The chart enforces this at render time - enabling autoscaling (or
+  > `replicaCount>1`) without them fails the render.
+  >
+  > On the **umbrella** chart these are subchart keys, so they need the
+  > `openmrs-backend.` prefix - and SeaweedFS also needs its own top-level toggle to
+  > actually deploy. The full working set is **four** values:
+  >
+  > ```
+  > --set openmrs-backend.autoscaling.enabled=true \
+  > --set openmrs-backend.infinispan.clustered=true \
+  > --set openmrs-backend.seaweedfs.enabled=true \
+  > --set seaweedfs.enabled=true      # top-level - deploys SeaweedFS itself
+  > ```
+  >
+  > (On the standalone `openmrs-backend` chart it's just `autoscaling.enabled`,
+  > `infinispan.clustered`, `seaweedfs.enabled`.) Mind the cost: enabling SeaweedFS
+  > at umbrella defaults adds ~11 pods (3 master, 3 volume, 3 filer, 2 s3) on top of
+  > MariaDB's 3 Galera replicas - size the node group accordingly.
+- **Node level (Kubernetes Cluster Autoscaler)** - the `openmrs-operator` chart can
+  deploy the Cluster Autoscaler (`clusterAutoscaler.enabled=true`, default off), which
+  scales the managed node group / auto-scaling group within its min/max bounds. The
+  chart is cloud-agnostic: implementers pick their provider via
+  `clusterAutoscaler.cloudProvider`. Only `aws` is validated here; the upstream
+  chart also supports `azure`, `gce`, `magnum`, `clusterapi` and others, but those
+  need provider-specific values before they render a valid manifest (e.g. `magnum`
+  requires `clusterAutoscaler.cloudConfigPath`). No provider is hard-coded.
+  Discovery is tag-based (`k8s.io/cluster-autoscaler/<cluster>=owned`): on EKS
+  those tags are applied automatically to the managed node group's ASG, so there's
+  nothing to set by hand; on other providers tag the node group yourself. For EKS,
+  the Terraform module provides the building blocks: a `lifecycle` guard on the
+  node group in `terraform/modules/eks/cluster.tf` (so `terraform apply` doesn't
+  fight CA over `desired_size`), and a least-privilege IRSA role in
+  `terraform/modules/eks/iam.tf` whose ARN is exported as the
+  `cluster_autoscaler_role_arn` module output. Wiring that ARN onto the CA
+  ServiceAccount is a manual install-time step (not yet automated in
+  `terraform-helm`): pass it - plus the cluster's region - when installing the
+  operator chart, e.g.
+  ```
+  helm dependency update ./helm/openmrs-operator   # once - vendors the operator subcharts (charts/ is gitignored)
+  helm upgrade --install openmrs-operator ./helm/openmrs-operator -n openmrs-system --create-namespace \
+    --set traefik.enabled=false \
+    --set clusterAutoscaler.enabled=true \
+    --set clusterAutoscaler.cloudProvider=aws \
+    --set clusterAutoscaler.awsRegion=<region> \
+    --set clusterAutoscaler.autoDiscovery.clusterName=<eks-cluster-name> \
+    --set 'clusterAutoscaler.rbac.serviceAccount.annotations.eks\.amazonaws\.com/role-arn'=$(terraform -chdir=terraform output -raw cluster_autoscaler_role_arn)
+  ```
+  `awsRegion` must match the cluster's region (this repo's is `us-east-2`); without
+  it the upstream chart pins `AWS_REGION=us-east-1` and CA silently manages nothing.
+  `traefik.enabled=false` is set because the chart's Traefik defaults are
+  Kind-specific (control-plane `nodeSelector` + `hostPort: 8080`) and would sit
+  Pending on EKS; leave it off here, but if the cluster already runs the operator
+  chart omit that flag, or the upgrade removes the gateway.
+
+  > **What CA will and won't reclaim:** CA scales the group up for pending pods and
+  > removes a node it added once that node empties, but it will **not** consolidate a
+  > node still running a SeaweedFS (or Traefik / Metrics Server) pod - those mount
+  > `emptyDir`/`hostPath` and CA's default `--skip-nodes-with-local-storage=true`
+  > keeps such nodes. So backend replica scale-out/scale-in works, but full
+  > consolidation of nodes hosting the shared infra is a follow-up (per-component
+  > `safe-to-evict-local-volumes` annotations plus a PVC for the SeaweedFS master),
+  > not part of this PR.
+
+  Local Kind clusters must never run the CA (no node group), hence the default
+  `false`.
 
 ### Make targets
 
@@ -336,7 +417,7 @@ The last three rows are the trap in this table: the *path* didn't change, only w
 
 #### Common parameters
 
-Prepend with the name of the service: `openmrs-backend`, `openmrs-frontend`, `traefik-gateway`, `mariadb`.
+Prepend with the name of the service: `openmrs-backend`, `openmrs-frontend`, `mariadb`. (The `openmrs-operator` chart is installed separately - see the Scaling section for its values.)
 
 | Name                | Description                  | Default Value                                            |
 |---------------------|------------------------------|----------------------------------------------------------|
@@ -596,7 +677,7 @@ To install Helm Charts from source run (see above for possible settings):
       helm upgrade --install --create-namespace -n openmrs --values ../kind-openmrs.yaml openmrs .
 
 
-If you made any changes in helm/openmrs-backend or helm/openmrs-frontend or helm/traefik-gateway you need to update 
+If you made any changes in helm/openmrs-backend, helm/openmrs-frontend or helm/openmrs-operator you need to update 
 dependencies and run helm upgrade.
 
 
@@ -633,8 +714,7 @@ helm                              # helm charts
 ├── openmrs                       # umbrella chart
 ├── openmrs-backend               # backend subchart
 ├── openmrs-frontend              # frontend subchart
-├── traefik-gateway               # Traefik Gateway API subchart
-├── openmrs-operator              # Cluster operators chart (MariaDB, ECK, Traefik, Gateway API)
+├── openmrs-operator              # Cluster operators chart (MariaDB, ECK, Traefik, Gateway API, Metrics Server, Cluster Autoscaler)
 ├── kind-config.yaml              # Kind cluster definition
 ├── kind-init.yaml                # Cluster prerequisites
 ├── kind-openmrs.yaml             # OpenMRS values (local dev)

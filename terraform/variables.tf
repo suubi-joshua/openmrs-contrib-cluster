@@ -105,7 +105,7 @@ variable "eks_node_instance_type" {
 
 variable "eks_desired_num_of_nodes" {
   type        = number
-  description = "Desired Capacity for EKS Node Group"
+  description = "Initial desired capacity for the EKS node group. Applies at CREATE time only: the node group ignores changes to desired_size (lifecycle in modules/eks/cluster.tf) so Cluster Autoscaler owns it out-of-band. Editing this and re-applying is a no-op; resize via CA or `aws eks update-nodegroup-config`."
 }
 
 variable "eks_min_num_of_nodes" {

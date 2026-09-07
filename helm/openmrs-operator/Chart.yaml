@@ -1,8 +1,8 @@
 apiVersion: v2
 name: openmrs-operator
-description: Cluster-level operators and infrastructure for OpenMRS (MariaDB operator, ECK operator, Traefik, Gateway API)
+description: Cluster-level operators and infrastructure for OpenMRS (MariaDB operator, ECK operator, Traefik, Gateway API, Metrics Server, Cluster Autoscaler)
 type: application
-version: 2.0.0
+version: 2.1.0
 appVersion: "1.0"
 
 dependencies:
@@ -25,3 +25,18 @@ dependencies:
     repository: https://traefik.github.io/charts
     version: "34.0.0"
     condition: traefik.enabled
+
+  - name: metrics-server
+    repository: https://kubernetes-sigs.github.io/metrics-server
+    version: "3.14.0"
+    condition: metrics-server.enabled
+
+  - name: cluster-autoscaler
+    repository: https://kubernetes.github.io/autoscaler
+    # Must track the cluster's K8s minor: 9.43.3 -> CA v1.31.0, matches eks_version=1.31
+    # (terraform/nonprod.tfvars). Bump when eks_version's minor changes.
+    version: "9.43.3"
+    # Alias so values under `clusterAutoscaler:` reach the subchart (Helm keys
+    # subchart values by the dependency name otherwise).
+    alias: clusterAutoscaler
+    condition: clusterAutoscaler.enabled

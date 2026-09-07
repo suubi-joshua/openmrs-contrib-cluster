@@ -8,6 +8,11 @@ spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  {{- if .Values.persistence.enabled }}
+  persistentVolumeClaimRetentionPolicy:
+    whenScaled: {{ .Values.persistence.retentionPolicy.whenScaled | default (ternary "Delete" "Retain" .Values.autoscaling.enabled) }}
+    whenDeleted: {{ .Values.persistence.retentionPolicy.whenDeleted | default "Retain" }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "openmrs-backend.selectorLabels" . | nindent 6 }}
@@ -35,6 +40,23 @@ spec:
       serviceAccountName: {{ include "openmrs-backend.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      # Soft anti-affinity (default): spread replicas across nodes, but preferred
+      # (not required) so the backend still schedules on a single-node cluster.
+      # Set .Values.affinity to override (e.g. node affinity, or required anti-affinity).
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: {{ .Values.statefulset.topology.spread | default "kubernetes.io/hostname" }}
+                labelSelector:
+                  matchLabels:
+                    {{- include "openmrs-backend.selectorLabels" . | nindent 20 }}
+      {{- end }}
       volumes:
         {{- if .Values.elasticsearch.enabled }}
         - name: es-ca-cert
