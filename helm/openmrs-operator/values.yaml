@@ -48,6 +48,9 @@ metrics-server:
   # cluster already runs the EKS-managed add-on. (--kubelet-insecure-tls for
   # Kind is set in bootstrap.sh, not here, so real clouds keep TLS verification.)
   enabled: true
+  # Reserved: bootstrap.sh sets args[0]=--kubelet-insecure-tls for Kind via --set. Put extra
+  # flags in metrics-server.defaultArgs instead, or they collide with that index.
+  args: []
 
 clusterAutoscaler:
   enabled: false

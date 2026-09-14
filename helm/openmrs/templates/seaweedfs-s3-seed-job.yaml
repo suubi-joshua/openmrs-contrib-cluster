@@ -1,0 +1,57 @@
+{{- if and .Values.seaweedfs.enabled .Values.seaweedfs.s3.enabled (default (dict) .Values.s3Seed).enabled (not .Values.seaweedfs.s3.enableAuth) }}
+{{- /*
+Seeds the primary's identity (scoped Read/Write/List on its own bucket, not Admin, so the
+primary can't reach tenant buckets) + the primary bucket into the filer-backed IAM store (the
+gateway runs enableAuth=false), so auth is enforced from the start and the backend can connect.
+Verifies the identity applied and fails the hook otherwise, since weed shell's exit code does
+not reflect per-command success.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-seaweedfs-s3-seed
+  labels:
+    {{- include "openmrs.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.s3Seed.backoffLimit | default 12 }}
+  # weed shell hangs forever on an unresolvable master; bound it (below the helm --timeout)
+  # so the Job fails with its own error instead of hanging until helm times out.
+  activeDeadlineSeconds: {{ .Values.s3Seed.activeDeadlineSeconds | default 240 }}
+  template:
+    metadata:
+      labels:
+        {{- include "openmrs.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: s3-seed
+          image: {{ .Values.s3Seed.image | quote }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              printf 's3.configure -user primary-admin -access_key %s -secret_key %s -actions Read:%s,Write:%s,List:%s -apply\ns3.bucket.create -name %s\n' \
+                "$ACCESS_KEY" "$SECRET_KEY" "$BUCKET" "$BUCKET" "$BUCKET" "$BUCKET" | weed shell -master "$MASTER"
+              printf 's3.configure -apply=false\n' | weed shell -master "$MASTER" | grep -qF '"primary-admin"' \
+                || { echo "s3Seed FAILED: primary-admin identity not present in filer IAM after apply"; exit 1; }
+              echo "s3Seed OK: primary-admin identity present"
+          env:
+            - name: MASTER
+              value: {{ printf "%s-seaweedfs-master.%s:9333" .Release.Name .Release.Namespace | quote }}
+            - name: BUCKET
+              value: {{ dig "seaweedfs" "s3" "bucketName" "" (index .Values "openmrs-backend") | default "openmrs" | quote }}
+            - name: ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-seaweedfs-s3-seed-creds
+                  key: accessKey
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-seaweedfs-s3-seed-creds
+                  key: secretKey
+{{- end }}

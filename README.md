@@ -110,6 +110,25 @@ Horizontal scaling has two layers:
   > `infinispan.clustered`, `seaweedfs.enabled`.) Mind the cost: enabling SeaweedFS
   > at umbrella defaults adds ~11 pods (3 master, 3 volume, 3 filer, 2 s3) on top of
   > MariaDB's 3 Galera replicas - size the node group accordingly.
+
+  > **Sticky sessions are backend-only.** Only the backend holds session state, so
+  > only it gets a session-affinity `TraefikService`; the frontend is a stateless SPA
+  > (static assets, the session lives in the backend) and needs none. The cookie name
+  > is overridable per tenant (`openmrs-backend.traefikService.sticky.cookie.name`,
+  > default `openmrs_session`) to avoid collisions on a shared gateway, and is marked
+  > `Secure` by default (`traefikService.sticky.cookie.secure=true`) for production
+  > HTTPS. **Set it to `false` for plain-HTTP setups - e.g. testing multiple replicas
+  > locally on Kind - or the browser drops the cookie and stickiness silently breaks.**
+  > (A single-replica install renders no cookie at all. Note this default changed: prior
+  > releases emitted `secure: false`, so an existing plain-HTTP multi-replica deployment
+  > flips to `Secure` on upgrade and silently loses stickiness - set
+  > `traefikService.sticky.cookie.secure=false` explicitly there.)
+
+  > **Clustered-cache DNS re-discovery.** With `infinispan.clustered=true` the backend
+  > shortens the JVM DNS cache to `infinispan.dnsCacheTtlSeconds` (default 5) so JGroups
+  > DNS_PING re-resolves the headless Service and finds new or replaced pods promptly on
+  > scale events, instead of waiting out the JVM's ~30s default. Leave it low where pods
+  > churn (autoscaling); raise it to trim DNS lookups on a stable cluster.
 - **Node level (Kubernetes Cluster Autoscaler)** - the `openmrs-operator` chart can
   deploy the Cluster Autoscaler (`clusterAutoscaler.enabled=true`, default off), which
   scales the managed node group / auto-scaling group within its min/max bounds. The
@@ -310,6 +329,61 @@ echo "127.0.0.1 coast.example.com" | sudo tee -a /etc/hosts
 kubectl port-forward -n tenant-<tenant> svc/<tenant>-openmrs-backend 8080:8080
 ```
 
+#### Scaling a tenant
+
+A tenant scales horizontally the same way the primary does - by flipping the shared
+`openmrs-backend` values - plus per-tenant object storage. Running more than one
+replica requires clustered cache **and** shared storage (the backend guard enforces
+it). By default a tenant shares the primary's SeaweedFS with **its own bucket and its
+own bucket-scoped credentials**, so one tenant's key can never touch another's files:
+
+```bash
+helm install <tenant> helm/openmrs-tenant \
+  -n tenant-<tenant> --create-namespace \
+  # ... the DB + gateway values from above ...
+  --set openmrs-backend.replicaCount=3 \
+  --set openmrs-backend.infinispan.clustered=true \
+  --set openmrs-backend.autoscaling.enabled=true \
+  --set openmrs-frontend.autoscaling.enabled=true \
+  --set openmrs-backend.traefikService.sticky.cookie.name=openmrs_session_<tenant> \
+  --set openmrs-backend.seaweedfs.enabled=true \
+  --set openmrs-backend.seaweedfs.s3.endpoint=http://<primary-release>-seaweedfs-s3.<primary-ns>.svc.cluster.local:8333 \
+  --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-<tenant> \
+  --set openmrs-backend.seaweedfs.s3.credentials.accessKey=<tenant>-key \
+  --set openmrs-backend.seaweedfs.s3.credentials.secretKey=<tenant-secret> \
+  --set s3Bootstrap.enabled=true \
+  --set s3Bootstrap.master=<primary-release>-seaweedfs-master.<primary-ns>.svc.cluster.local:9333
+```
+
+> **Bucket name must be DNS-style (hyphens, not underscores).** The tenant *database*
+> is `openmrs_<tenant>` (underscores, MySQL), but the S3 *bucket* must be a valid S3
+> name — use `openmrs-<tenant>` (`openmrs_<tenant>` is rejected as `InvalidBucketName`).
+> The tenant chart guards this at render time.
+
+`s3Bootstrap` runs a post-install Job that creates the tenant's bucket and a SeaweedFS
+identity scoped to `Read/Write/List:<bucket>`. For this to take effect the shared
+SeaweedFS S3 gateway must use **filer-backed dynamic IAM** (`seaweedfs.s3.enableAuth=false`,
+the default here) so runtime-provisioned identities are honoured and hot-reloaded; the
+umbrella's `s3Seed` hook seeds the primary's own bucket-scoped identity so auth is still
+enforced (the primary cannot read or write tenant buckets). To use
+**managed S3** instead of SeaweedFS, point `seaweedfs.s3.endpoint` at the S3 URL, set
+`seaweedfs.s3.forcePathStyle=false` with a real `seaweedfs.s3.region`, provision the
+bucket/credentials in the cloud, and leave `s3Bootstrap.enabled=false`. Give the backend
+either static `openmrs-backend.seaweedfs.s3.credentials.accessKey`/`.secretKey`, **or**,
+for IRSA / instance credentials, set `openmrs-backend.seaweedfs.s3.credentials.useDefaultChain=true`
+(this emits no static keys, so the AWS SDK default credential chain applies) and attach the
+role via `openmrs-backend.serviceAccount.annotations` (e.g. `eks.amazonaws.com/role-arn`).
+
+> **Static key charset:** `s3Bootstrap` (and the primary `s3Seed`) pass the access/secret
+> keys to a `weed shell` command, so the chart restricts them to `[A-Za-z0-9/+=_.@-]` with no
+> leading `-` (rejecting whitespace/flag injection at render time). Managed-S3 keys that need
+> other characters should use `useDefaultChain=true` rather than static keys.
+
+> **Rotating a tenant key** by re-running `s3Bootstrap` with a new
+> `credentials.accessKey` *adds* the new key to the tenant's SeaweedFS identity but does
+> **not** revoke the old one — the previous key stays valid. After a leak, delete the old
+> key directly against the shared SeaweedFS (`weed shell` → `s3.accesskey.delete`).
+
 > **Note on routing:** tenant HTTPRoutes are disabled by default (`gateway.enabled=false`).
 > To enable host-based routing, set `openmrs-backend.gateway.enabled=true` and
 > `openmrs-backend.gateway.hostnames` (and likewise for frontend). The shared charts'
@@ -352,11 +426,32 @@ through. For the full shared-chart surface, see `helm/openmrs-backend/values.yam
 | `openmrs-frontend.configUrls` | Distro config JSON URLs (`SPA_CONFIG_URLS`); omitted when empty | `""` |
 | `openmrs-frontend.replicaCount` | Frontend replicas | `1` |
 | `openmrs-frontend.podLabels` | Extra labels for frontend pods | `{}` |
+| `openmrs-backend.replicaCount` | Backend replicas; `>1` requires clustered cache **and** shared storage (guarded) | `1` |
+| `openmrs-backend.infinispan.clustered` | Clustered L2 cache (JGroups DNS_PING); required for `>1` replica | `false` |
+| `openmrs-backend.autoscaling.enabled` | HPA for the backend (needs clustered cache + shared storage) | `false` |
+| `openmrs-backend.autoscaling.minReplicas` / `.maxReplicas` | Backend HPA bounds | `1` / `5` |
+| `openmrs-backend.autoscaling.targetCPUUtilizationPercentage` | Backend HPA CPU target | `80` |
+| `openmrs-backend.traefikService.sticky.cookie.name` | Sticky-session cookie name; set per tenant to avoid collisions on the shared gateway | `"openmrs_session"` |
+| `openmrs-backend.seaweedfs.enabled` | Use the primary's shared SeaweedFS for this tenant's object storage | `false` |
+| `openmrs-backend.seaweedfs.s3.endpoint` | Primary's S3 endpoint (e.g. `http://openmrs-seaweedfs-s3.openmrs.svc.cluster.local:8333`) | `""` |
+| `openmrs-backend.seaweedfs.s3.bucketName` | Tenant bucket; DNS-style. With `s3Bootstrap.enabled=true` must be exactly `openmrs-<tenant>` (`openmrs_<tenant>` is rejected as `InvalidBucketName`) | `""` |
+| `openmrs-backend.seaweedfs.s3.region` | S3 region | `us-east-2` |
+| `openmrs-backend.seaweedfs.s3.forcePathStyle` | Path-style addressing (`"true"` for SeaweedFS; `"false"` for managed S3) | `"true"` |
+| `openmrs-backend.seaweedfs.s3.credentials.accessKey` / `.secretKey` | Tenant's bucket-scoped key; required when `seaweedfs.enabled` unless `useDefaultChain=true`. Charset `[A-Za-z0-9/+=_.@-]`, no leading `-`. With `s3Bootstrap.enabled=true` the access key must also contain the tenant name | `""` |
+| `openmrs-backend.seaweedfs.s3.credentials.useDefaultChain` | Managed S3 with IRSA/instance creds: emit no static keys, waive the key requirement | `false` |
+| `openmrs-frontend.autoscaling.enabled` | HPA for the frontend | `false` |
+| `openmrs-frontend.autoscaling.minReplicas` / `.maxReplicas` / `.targetCPUUtilizationPercentage` | Frontend HPA bounds and CPU target | `1` / `5` / `80` |
+| `s3Bootstrap.enabled` | Provision this tenant's bucket + bucket-scoped identity on the shared SeaweedFS | `false` |
+| `s3Bootstrap.image` | SeaweedFS image for the bootstrap Job; match the deployed SeaweedFS version | `chrislusf/seaweedfs:4.31` |
+| `s3Bootstrap.master` | Shared SeaweedFS master the Job talks to | `openmrs-seaweedfs-master.openmrs.svc.cluster.local:9333` |
+| `s3Bootstrap.backoffLimit` | Job retry limit | `6` |
+| `s3Bootstrap.activeDeadlineSeconds` | Job deadline; caps a hang on an unresolvable master. Keep under the install `--timeout` so a hang fails the Job, not helm | `240` |
 
 Images and versions are inherited from the shared charts (backend `3.7.x-no-demo`,
 frontend `3.7.x`); override via `openmrs-backend.image.*` / `openmrs-frontend.image.*`
-if needed. Clustering, autoscaling, and shared storage are shared-chart features and
-are covered in later phases.
+if needed. Clustering, autoscaling, and shared object storage are the shared-chart
+features in the rows above — enable them per tenant with the `replicaCount` /
+`infinispan.clustered` / `autoscaling.*` and `seaweedfs.*` / `s3Bootstrap.*` values.
 
 ### Alternative: install from Helm registry
 
@@ -443,7 +538,7 @@ and a tenant chart can consume it. Infra deploy/scale settings live on the umbre
 | `openmrs-backend.seaweedfs.enabled`                              | Wire the workload for S3 storage (injects S3 credentials into the Secret). Does **not** deploy SeaweedFS — see `seaweedfs.enabled` below | `false` |
 | `openmrs-backend.seaweedfs.admin.httpRoute.enabled`              | Expose a Gateway API HTTPRoute to the SeaweedFS Admin service (deployed separately by the umbrella)                     | `false` |
 | `openmrs-backend.seaweedfs.admin.httpRoute.hostnames`            | Hostnames for the admin HTTPRoute                                                                                       | `["localhost"]` |
-| `openmrs-backend.seaweedfs.s3.credentials.admin.accessKey` / `.secretKey` | S3 access/secret key — must match the umbrella's `seaweedfs.s3.credentials.admin.*` below                        | `"openmrs"` / `"OpenMRS123"` |
+| `openmrs-backend.seaweedfs.s3.credentials.admin.accessKey` / `.secretKey` | The primary backend's S3 credential, and the bucket-scoped identity the umbrella's `s3Seed` hook seeds (`Read/Write/List` on the primary's bucket only, **not** cluster-admin - it cannot reach tenant buckets). **This is the value to set/rotate for the primary's storage.** | `"openmrs"` / `"OpenMRS123"` |
 
 #### Umbrella infra parameters (`helm/openmrs`)
 
@@ -468,8 +563,9 @@ exists in a tenant chart consuming the shared `openmrs-backend`/`openmrs-fronten
 | `seaweedfs.admin.enabled`                                    | Deploy the SeaweedFS Admin component                                                            | `false`           |
 | `seaweedfs.admin.secret.adminPassword`                       | Admin dashboard password (empty = no auth)                                                     | `"Admin123"`      |
 | `seaweedfs.s3.replicas`                                      | Number of S3 API gateway replicas (stateless)                                                  | `2`               |
-| `seaweedfs.s3.enableAuth`                                    | Enable S3 credential authentication                                                            | `true`            |
-| `seaweedfs.s3.credentials.admin.accessKey` / `.secretKey`    | S3 access/secret key — must match `openmrs-backend.seaweedfs.s3.credentials.admin.*` above      | `"openmrs"` / `"OpenMRS123"` |
+| `seaweedfs.s3.enableAuth`                                    | `false` = filer-backed dynamic IAM: the gateway reads identities from the filer (so per-tenant `s3-bootstrap` identities are honoured and hot-reloaded) and the `s3Seed` hook seeds the primary's bucket-scoped identity. `true` = static `-config` file (admin-only; runtime per-tenant provisioning will not work). Auth is enforced either way. | `false`           |
+| `s3Seed.enabled` / `.image` / `.activeDeadlineSeconds`       | Post-install hook that seeds the primary's own identity (scoped `Read/Write/List` on its bucket, not `Admin`, so the primary cannot reach tenant buckets) into the filer-backed IAM store (only rendered when `seaweedfs.s3.enableAuth=false`); the primary bucket it creates follows `openmrs-backend.seaweedfs.s3.bucketName`. Verifies the identity applied and fails the install otherwise. `activeDeadlineSeconds` caps the hook (it races cold-start when installed without `--wait`), kept under the install `--timeout`. | `true` / `"chrislusf/seaweedfs:4.31"` / `240` |
+| `seaweedfs.s3.credentials.admin.accessKey` / `.secretKey`    | Static S3 admin credential, **only consumed when `seaweedfs.s3.enableAuth=true`**. In the default filer-backed mode it has no effect — set `openmrs-backend.seaweedfs.s3.credentials.admin.*` instead. | `"openmrs"` / `"OpenMRS123"` |
 | `monitoring.enabled`                                          | Enable monitoring (deploys Grafana, Loki, Alloy)                                                | `false`           |
 | `grafana.adminPassword`                                       | Grafana admin password                                                                          | `"Admin123"`      |
 | `grafana.ingress.enabled` / `.hosts`                          | Ingress for Grafana (disabled when using HTTPRoute)                                              | `false` / `["localhost"]` |
@@ -496,14 +592,14 @@ which is workload-only). When `seaweedfs.enabled=true`, the umbrella deploys:
 | Filer | 3 | Metadata store required by the S3 gateway (uses MariaDB as backend for easy backup) |
 | S3 gateway | 2 | Stateless S3 API endpoint at `<release>-seaweedfs-s3:8333` (depends on filer) |
 
-Credentials are configured via `s3.credentials.admin` values and injected into
-the backend's Secret as `storage.s3.accessKeyId` and `storage.s3.secretAccessKey`.
-This is declared in two places — `openmrs-backend.seaweedfs.s3.credentials.admin.*`
-(the workload's copy) and the umbrella's top-level `seaweedfs.s3.credentials.admin.*`
-(the third-party chart's own copy) — and must be kept in sync by hand; the
-third-party chart has its own values schema and doesn't share Helm's `global.*`
-mechanism the rest of the credential wiring uses. See the parameter tables above
-for both sides.
+The primary's S3 credential is injected into the backend's Secret as
+`storage.s3.accessKeyId`/`storage.s3.secretAccessKey` and, in the default filer-backed
+mode, seeded into the gateway by the `s3Seed` hook. Both read
+`openmrs-backend.seaweedfs.s3.credentials.admin.*`, so that is the single value to set.
+The umbrella's top-level `seaweedfs.s3.credentials.admin.*` is a separate copy consumed
+**only** by the third-party subchart's static config (`seaweedfs.s3.enableAuth=true`); if
+you run that mode, keep the two in sync by hand — the subchart has its own values schema
+and can't read Helm's `global.*`.
 
 ##### SeaweedFS Filer: MariaDB backend
 
@@ -544,9 +640,11 @@ and **must be reviewed before production use**:
 |---------|-----------|------------|
 | Grafana default credentials (`admin`/`Admin123`) | Safe — localhost only | **Must change** — use a strong password or SSO |
 | SeaweedFS security (`enableSecurity: false`) | Safe — no external access | **Must enable** — otherwise data is publicly accessible |
+| SeaweedFS S3 auth (`seaweedfs.s3.enableAuth: false`, filer-backed IAM) | Cluster-internal; brief pre-seed window (worst on the `true → false` upgrade) | Auth is enforced once the `s3Seed` hook seeds an identity. A brief pre-seed window accepts anonymous access on **a fresh install, or the `enableAuth: true → false` upgrade** from a released chart (which ships `true`). The upgrade is the worse case: helm rolls the gateway Deployment to the config-less version **before** the `post-upgrade` hook runs, so for the roll plus the seed Job anything in the cluster (tenant pods included) can read/write the primary's bucket unauthenticated — and on that path the bucket already holds data. The hook verifies and **fails the install** if seeding doesn't take, so the store is never left silently open in steady state. For a zero-length window on both paths, seed via a gateway initContainer (moving the seed to `pre-upgrade` does not help — its creds Secret would not exist yet on the first upgrade). |
 | SeaweedFS Admin default credentials (`admin`/`Admin123`) | Safe — localhost only | **Must change** — use a strong password |
 | HTTP (no TLS) | Fine — localhost only | **Must enable TLS** on the Gateway listener |
 | HTTPRoute auth | Safe — traffic is cluster-internal only | **Add auth middleware** (e.g., OAuth, basic auth) via HTTPRoute filters or a reverse proxy |
+| Sticky-session cookie `Secure` flag (`openmrs-backend.traefikService.sticky.cookie.secure`) | Set `false` to test multiple replicas on plain-HTTP Kind, or the cookie is dropped | **Keep `true`** (default), an HTTPS-only cookie |
 
 For production, start with these overrides:
 

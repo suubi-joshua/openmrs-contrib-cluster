@@ -29,6 +29,19 @@ dbBootstrap:
   # operator's own default is Delete — hence the safe Skip default).
   cleanupPolicy: Skip
 
+# Post-install Job that provisions this tenant's bucket + a bucket-scoped identity on
+# the shared SeaweedFS. Leave off when the tenant uses managed S3.
+s3Bootstrap:
+  enabled: false
+  # Match the deployed SeaweedFS version so weed-shell commands stay compatible.
+  image: "chrislusf/seaweedfs:4.31"
+  # The shared SeaweedFS master the Job talks to.
+  master: "openmrs-seaweedfs-master.openmrs.svc.cluster.local:9333"
+  backoffLimit: 6
+  # Caps the Job (weed shell blocks on an unresolvable master, so backoffLimit can't retry a
+  # hang); keep under the install --timeout so a real hang fails the Job instead of helm.
+  activeDeadlineSeconds: 240
+
 openmrs-backend:
   # Off by default; set hostnames alongside enabled.
   gateway:
@@ -52,6 +65,43 @@ openmrs-backend:
 
   podLabels: {}
 
+  # Horizontal scaling (opt-in; see README "Scaling a tenant"). A scaled tenant needs
+  # clustered cache + shared object storage below, enforced by the backend's guard.
+  replicaCount: 1
+  infinispan:
+    clustered: false
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 80
+  traefikService:
+    sticky:
+      cookie:
+        # Set per tenant to avoid cross-tenant cookie collisions on the shared gateway.
+        name: "openmrs_session"
+  # Shares the primary's SeaweedFS with its own bucket + bucket-scoped credentials.
+  # endpoint must point at the primary's S3; for managed S3 use the S3 URL,
+  # forcePathStyle "false", and a real region.
+  seaweedfs:
+    enabled: false
+    s3:
+      endpoint: ""       # e.g. http://openmrs-seaweedfs-s3.openmrs.svc.cluster.local:8333
+      bucketName: ""     # distinct per tenant; S3 names must be DNS-style, e.g. openmrs-<tenant> (hyphens, not underscores)
+      region: "us-east-2"
+      forcePathStyle: "true"
+      credentials:
+        # This tenant's bucket-scoped key (s3Bootstrap provisions the matching identity).
+        # Required when seaweedfs.enabled - the admin fallback below is blanked.
+        accessKey: ""
+        secretKey: ""
+        # Blanked so a tenant never falls back to the primary's shared SeaweedFS credential.
+        admin:
+          accessKey: ""
+          secretKey: ""
+        # true only for managed S3 with IRSA/instance creds: waives the key requirement, emits no keys.
+        useDefaultChain: false
+
 openmrs-frontend:
   enabled: true
   # Off by default; set hostnames alongside enabled.
@@ -70,5 +120,11 @@ openmrs-frontend:
   configUrls: ""
 
   replicaCount: 1
+
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 80
 
   podLabels: {}

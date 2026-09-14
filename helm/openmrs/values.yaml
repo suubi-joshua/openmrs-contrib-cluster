@@ -124,6 +124,8 @@ seaweedfs:
     dataDirs:
       - name: data
         type: "persistentVolumeClaim"
+        # EKS default SC; non-EKS must override (Kind does, in kind-openmrs.yaml). The subchart
+        # renders storageClassName unconditionally, so "" would leave the PVC Pending.
         storageClass: "gp2"
         size: "8Gi"
         maxVolumes: 0
@@ -157,12 +159,26 @@ seaweedfs:
   s3:
     enabled: true
     replicas: 2
-    enableAuth: true
-    # Must match openmrs-backend.seaweedfs.s3.credentials.admin.* above.
+    # false = filer-backed dynamic IAM: gateway reads identities from the filer, so
+    # per-tenant s3-bootstrap identities work and hot-reload; the primary's bucket-scoped
+    # identity is seeded by the s3Seed hook below. true = static -config file (no runtime tenants).
+    enableAuth: false
+    # Only consumed when enableAuth=true (static -config). The default filer-backed mode
+    # uses openmrs-backend.seaweedfs.s3.credentials.admin.* instead; this has no effect there.
     credentials:
       admin:
         accessKey: "openmrs"
         secretKey: "OpenMRS123"
+
+# Seeds the primary's bucket-scoped identity + primary bucket into the filer-backed IAM store (only when
+# enableAuth=false). Reads openmrs-backend.seaweedfs.s3.credentials.admin.* (the key the
+# backend uses); bucket follows openmrs-backend.seaweedfs.s3.bucketName.
+s3Seed:
+  enabled: true
+  image: "chrislusf/seaweedfs:4.31"
+  # Caps the seed Job (post-install hook races cold-start when installed without --wait);
+  # keep under the install --timeout so a real hang surfaces as a Job failure, not a helm timeout.
+  activeDeadlineSeconds: 240
 
 monitoring:
   enabled: false

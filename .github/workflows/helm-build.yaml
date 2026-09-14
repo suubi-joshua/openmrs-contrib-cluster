@@ -291,7 +291,7 @@ jobs:
           if grep -q 'kind: HTTPRoute' /tmp/tenant.yaml; then
             echo "expected NO HTTPRoutes in the default tenant render (gateway must stay off by default)"; exit 1
           fi
-          # Phase 2: operator Database/User/Grant CRs + credential Secret render,
+          # operator Database/User/Grant CRs + credential Secret render,
           # DB defaults to openmrs_<tenant>.
           grep -q 'kind: Database' /tmp/tenant.yaml
           grep -q 'kind: User' /tmp/tenant.yaml
@@ -354,6 +354,38 @@ jobs:
             echo "expected the guard to reject a tenant name containing underscores"; exit 1
           fi
           grep -qF 'global.tenant.name must not contain underscores' <<<"$err"
+          # Same collision via s3Bootstrap with dbBootstrap off (both - and _ normalize to _ in
+          # the SeaweedFS identity), so the guard must fire there too; and a valid hyphen name
+          # renders the bootstrap Job with the 240s deadline default.
+          S3T="--set dbBootstrap.enabled=false \
+            --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_east_coast \
+            --set openmrs-backend.db.hostname=h \
+            --set openmrs-backend.db.username=u --set openmrs-backend.db.password=p \
+            --set openmrs-backend.seaweedfs.enabled=true \
+            --set openmrs-backend.seaweedfs.s3.endpoint=http://s3:8333 \
+            --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-east-coast \
+            --set-string openmrs-backend.seaweedfs.s3.credentials.accessKey=east-coast-key \
+            --set-string openmrs-backend.seaweedfs.s3.credentials.secretKey=ec-secret \
+            --set s3Bootstrap.enabled=true"
+          if err=$(helm template t helm/openmrs-tenant --set global.tenant.name=east_coast $S3T 2>&1); then
+            echo "underscore guard must fire under s3Bootstrap with dbBootstrap off"; exit 1
+          fi
+          grep -qF 'global.tenant.name must not contain underscores' <<<"$err"
+          helm template t helm/openmrs-tenant --set global.tenant.name=east-coast $S3T > /tmp/tenant-s3b.yaml
+          grep -qE 'activeDeadlineSeconds: 240' /tmp/tenant-s3b.yaml
+          # s3Bootstrap mints a real Read/Write/List grant on bucketName, and SeaweedFS keys
+          # identities by name only, so both provisioned identifiers must carry the tenant name.
+          # The valid-shape checks above alone let a tenant claim the primary's bucket or key.
+          if err=$(helm template t helm/openmrs-tenant --set global.tenant.name=east-coast $S3T \
+              --set openmrs-backend.seaweedfs.s3.bucketName=openmrs 2>&1); then
+            echo "expected the tenant-scoping guard to reject a bucket that lacks the tenant name"; exit 1
+          fi
+          grep -qF 's3.bucketName (openmrs) must be exactly' <<<"$err"
+          if err=$(helm template t helm/openmrs-tenant --set global.tenant.name=east-coast $S3T \
+              --set-string openmrs-backend.seaweedfs.s3.credentials.accessKey=ec-key 2>&1); then
+            echo "expected the tenant-scoping guard to reject an accessKey that lacks the tenant name"; exit 1
+          fi
+          grep -qF 's3.credentials.accessKey must contain the tenant name' <<<"$err"
           # Tenant-scoping guard: username must be exactly openmrs_<tenant>_user.
           if err=$(helm template tenant1 helm/openmrs-tenant $TENANT_VALUES \
               --set openmrs-backend.db.username=openmrs 2>&1); then
@@ -443,7 +475,7 @@ jobs:
           helm template tenant1 helm/openmrs-tenant $TENANT_VALUES \
             --set 'openmrs-backend.db.password=12345' > /tmp/tenant-digit-pw.yaml
           grep -qF 'password: "12345"' /tmp/tenant-digit-pw.yaml
-          # Forward check (Phase 3): when routing IS enabled, the per-tenant spaPath still
+          # Forward check: when routing IS enabled, the per-tenant spaPath still
           # reaches the route match and the redirect target, not just the ConfigMap.
           helm template tenant1 helm/openmrs-tenant $TENANT_VALUES \
             --set openmrs-backend.gateway.enabled=true \
@@ -598,5 +630,255 @@ jobs:
           if grep -q '/openmrs/spa/home' helm/openmrs-tenant/templates/NOTES.txt; then
             echo "NOTES.txt must not hardcode /openmrs/spa when spaPath is used"; exit 1
           fi
+
+      - name: Validate tenant scaling (sticky cookie, HPAs, s3-bootstrap, storage swap)
+        run: |
+          SCALE="--set global.tenant.name=demo \
+            --set dbBootstrap.enabled=false \
+            --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+            --set openmrs-backend.db.hostname=h \
+            --set openmrs-backend.db.username=openmrs_demo_user \
+            --set openmrs-backend.db.password=ci-pass \
+            --set openmrs-backend.replicaCount=3 \
+            --set openmrs-backend.infinispan.clustered=true \
+            --set openmrs-backend.autoscaling.enabled=true \
+            --set openmrs-frontend.autoscaling.enabled=true \
+            --set openmrs-backend.seaweedfs.enabled=true \
+            --set openmrs-backend.seaweedfs.s3.endpoint=http://openmrs-seaweedfs-s3.openmrs.svc.cluster.local:8333 \
+            --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-demo \
+            --set openmrs-backend.seaweedfs.s3.credentials.accessKey=demoAK \
+            --set openmrs-backend.seaweedfs.s3.credentials.secretKey=demoSK \
+            --set s3Bootstrap.enabled=true \
+            --set openmrs-backend.traefikService.sticky.cookie.name=openmrs_session_demo"
+          helm template demo helm/openmrs-tenant $SCALE > /tmp/tenant-scale.yaml
+          # Per-tenant sticky cookie (unique to the TraefikService)
+          grep -q 'name: openmrs_session_demo' /tmp/tenant-scale.yaml
+          # Backend + frontend both get an HPA
+          [ "$(grep -c 'kind: HorizontalPodAutoscaler' /tmp/tenant-scale.yaml)" = "2" ]
+          # s3-bootstrap Job + its scoped-credential Secret render, tenant bucket wired
+          grep -q 'name: demo-s3-bootstrap' /tmp/tenant-scale.yaml
+          # Pin the tenant grant too: bucket-scoped, never Admin (name-only grep is blind to it).
+          grep -q '\-actions Read:%s,Write:%s,List:%s' /tmp/tenant-scale.yaml
+          if grep -q '\-actions Admin' /tmp/tenant-scale.yaml; then
+            echo "the tenant s3-bootstrap identity must be bucket-scoped, not Admin"; exit 1
+          fi
+          grep -q 'name: demo-s3-credentials' /tmp/tenant-scale.yaml
+          grep -q 'storage.s3.bucketName: "openmrs-demo"' /tmp/tenant-scale.yaml
+          # Sticky cookie is Secure by default (production serves over HTTPS)
+          grep -q 'secure: true' /tmp/tenant-scale.yaml
+          # Clustered backend gets a short JVM DNS TTL for fast JGroups re-discovery
+          grep -q 'sun.net.inetaddr.ttl' /tmp/tenant-scale.yaml
+          # Backend store is swappable to managed S3 (forcePathStyle false + real region)
+          helm template t helm/openmrs-backend \
+            --set seaweedfs.enabled=true \
+            --set seaweedfs.s3.forcePathStyle=false \
+            --set seaweedfs.s3.region=eu-west-1 > /tmp/be-s3.yaml
+          grep -q 'storage.s3.forcePathStyle: "false"' /tmp/be-s3.yaml
+          grep -q 'storage.s3.region: "eu-west-1"' /tmp/be-s3.yaml
+          # An unset forcePathStyle must still come out path-style ("<nil>" would not) - guards
+          # the kindIs "invalid" branch against a regression to `| default "true"`.
+          helm template t helm/openmrs-backend --set seaweedfs.enabled=true \
+            --set seaweedfs.s3.forcePathStyle=null | grep -q 'storage.s3.forcePathStyle: "true"'
+          # Storage guard: seaweedfs.enabled without an endpoint is rejected
+          if err=$(helm template demo helm/openmrs-tenant \
+              --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+              --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+              --set openmrs-backend.db.hostname=h \
+              --set openmrs-backend.db.username=openmrs_demo_user \
+              --set openmrs-backend.db.password=ci-pass \
+              --set openmrs-backend.seaweedfs.enabled=true 2>&1); then
+            echo "expected the guard to reject seaweedfs.enabled without an endpoint"; exit 1
+          fi
+          grep -qF 'requires openmrs-backend.seaweedfs.s3.endpoint' <<<"$err"
+          # Bucket-name guard: an underscore bucket (openmrs_<tenant>) is not a valid S3
+          # name and must be rejected at render time (use openmrs-<tenant>).
+          if err=$(helm template demo helm/openmrs-tenant \
+              --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+              --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+              --set openmrs-backend.db.hostname=h \
+              --set openmrs-backend.db.username=openmrs_demo_user \
+              --set openmrs-backend.db.password=ci-pass \
+              --set openmrs-backend.replicaCount=3 \
+              --set openmrs-backend.infinispan.clustered=true \
+              --set openmrs-backend.seaweedfs.enabled=true \
+              --set openmrs-backend.seaweedfs.s3.endpoint=http://s3:8333 \
+              --set openmrs-backend.seaweedfs.s3.bucketName=openmrs_demo 2>&1); then
+            echo "expected the guard to reject an underscore bucket name"; exit 1
+          fi
+          grep -qF 'not a valid S3 bucket name' <<<"$err"
+          # Credential guard: seaweedfs.enabled with a bucket + endpoint but no scoped key
+          # must be rejected - otherwise the backend Secret falls back to the shared
+          # credentials.admin.* instead of a key scoped to this tenant's bucket.
+          if err=$(helm template demo helm/openmrs-tenant \
+              --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+              --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+              --set openmrs-backend.db.hostname=h \
+              --set openmrs-backend.db.username=openmrs_demo_user \
+              --set openmrs-backend.db.password=ci-pass \
+              --set openmrs-backend.seaweedfs.enabled=true \
+              --set openmrs-backend.seaweedfs.s3.endpoint=http://s3:8333 \
+              --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-demo 2>&1); then
+            echo "expected the guard to reject seaweedfs.enabled without a scoped key"; exit 1
+          fi
+          grep -qF 'falls back to the shared credentials.admin.*' <<<"$err"
+          # Injection guard fires only when s3Bootstrap provisions via weed shell: whitespace /
+          # leading '-' in a key must be rejected there; a mid-string hyphen (demo-key) stays valid.
+          if helm template demo helm/openmrs-tenant \
+              --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+              --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+              --set openmrs-backend.db.hostname=h \
+              --set openmrs-backend.db.username=openmrs_demo_user --set openmrs-backend.db.password=ci-pass \
+              --set openmrs-backend.seaweedfs.enabled=true --set s3Bootstrap.enabled=true \
+              --set openmrs-backend.seaweedfs.s3.endpoint=http://s3:8333 \
+              --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-demo \
+              --set-string 'openmrs-backend.seaweedfs.s3.credentials.accessKey=bad key' \
+              --set-string openmrs-backend.seaweedfs.s3.credentials.secretKey=demo-secret >/dev/null 2>&1; then
+            echo "tenant accessKey with whitespace must be rejected"; exit 1
+          fi
+          if err=$(helm template demo helm/openmrs-tenant \
+              --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+              --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+              --set openmrs-backend.db.hostname=h \
+              --set openmrs-backend.db.username=openmrs_demo_user --set openmrs-backend.db.password=ci-pass \
+              --set openmrs-backend.seaweedfs.enabled=true --set s3Bootstrap.enabled=true \
+              --set openmrs-backend.seaweedfs.s3.endpoint=http://s3:8333 \
+              --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-demo \
+              --set-string openmrs-backend.seaweedfs.s3.credentials.accessKey=demo-key \
+              --set-string openmrs-backend.seaweedfs.s3.credentials.secretKey=-actions 2>&1); then
+            echo "tenant secretKey with a leading dash must be rejected"; exit 1
+          fi
+          grep -qF 'must not start with' <<<"$err"
+          helm template demo helm/openmrs-tenant \
+            --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+            --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+            --set openmrs-backend.db.hostname=h \
+            --set openmrs-backend.db.username=openmrs_demo_user --set openmrs-backend.db.password=ci-pass \
+            --set openmrs-backend.seaweedfs.enabled=true --set s3Bootstrap.enabled=true \
+            --set openmrs-backend.seaweedfs.s3.endpoint=http://s3:8333 \
+            --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-demo \
+            --set-string openmrs-backend.seaweedfs.s3.credentials.accessKey=demo-key \
+            --set-string openmrs-backend.seaweedfs.s3.credentials.secretKey=demo-secret >/dev/null
+          # Managed S3 (no s3Bootstrap, no weed shell): a special-char secret key must NOT be
+          # rejected - those keys only land in a Secret and MinIO/Wasabi allow arbitrary chars.
+          helm template demo helm/openmrs-tenant \
+            --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+            --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+            --set openmrs-backend.db.hostname=h \
+            --set openmrs-backend.db.username=openmrs_demo_user --set openmrs-backend.db.password=ci-pass \
+            --set openmrs-backend.seaweedfs.enabled=true --set s3Bootstrap.enabled=false \
+            --set openmrs-backend.seaweedfs.s3.endpoint=https://s3.wasabisys.com \
+            --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-demo \
+            --set-string 'openmrs-backend.seaweedfs.s3.credentials.accessKey=AKIAEXAMPLE' \
+            --set-string 'openmrs-backend.seaweedfs.s3.credentials.secretKey=Sp!S/kr3t+val' >/dev/null
+          # IRSA opt-out renders (no guard) and emits NO static S3 keys (default chain).
+          helm template demo helm/openmrs-tenant \
+            --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+            --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+            --set openmrs-backend.db.hostname=h \
+            --set openmrs-backend.db.username=openmrs_demo_user --set openmrs-backend.db.password=ci-pass \
+            --set openmrs-backend.seaweedfs.enabled=true \
+            --set openmrs-backend.seaweedfs.s3.endpoint=http://s3:8333 \
+            --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-demo \
+            --set openmrs-backend.seaweedfs.s3.credentials.useDefaultChain=true > /tmp/tenant-irsa.yaml
+          if grep -q 'storage.s3.accessKeyId' /tmp/tenant-irsa.yaml; then
+            echo "IRSA opt-out tenant must emit no static S3 keys"; exit 1
+          fi
+          # useDefaultChain must only be waived by an explicit true: the string "false" must
+          # NOT bypass the guard (Helm string-truthiness footgun).
+          if helm template demo helm/openmrs-tenant \
+              --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+              --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+              --set openmrs-backend.db.hostname=h \
+              --set openmrs-backend.db.username=openmrs_demo_user --set openmrs-backend.db.password=ci-pass \
+              --set openmrs-backend.seaweedfs.enabled=true \
+              --set openmrs-backend.seaweedfs.s3.endpoint=http://s3:8333 \
+              --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-demo \
+              --set-string openmrs-backend.seaweedfs.s3.credentials.useDefaultChain=false >/dev/null 2>&1; then
+            echo "string useDefaultChain=false must not bypass the scoped-key guard"; exit 1
+          fi
+          # useDefaultChain=true with a static key set is contradictory and must be rejected.
+          if err=$(helm template demo helm/openmrs-tenant \
+              --set global.tenant.name=demo --set dbBootstrap.enabled=false \
+              --set openmrs-backend.db.url=jdbc:mariadb://h:3306/openmrs_demo \
+              --set openmrs-backend.db.hostname=h \
+              --set openmrs-backend.db.username=openmrs_demo_user --set openmrs-backend.db.password=ci-pass \
+              --set openmrs-backend.seaweedfs.enabled=true \
+              --set openmrs-backend.seaweedfs.s3.endpoint=http://s3:8333 \
+              --set openmrs-backend.seaweedfs.s3.bucketName=openmrs-demo \
+              --set openmrs-backend.seaweedfs.s3.credentials.useDefaultChain=true \
+              --set openmrs-backend.seaweedfs.s3.credentials.accessKey=k 2>&1); then
+            echo "useDefaultChain=true with a static key must be rejected"; exit 1
+          fi
+          grep -qF 'means no static keys, but accessKey' <<<"$err"
+          # ServiceAccount annotations must render under metadata (indented), not at column 0.
+          helm template t helm/openmrs-backend \
+            --set serviceAccount.create=true \
+            --set 'serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::x:role/y' \
+            --show-only templates/serviceaccount.yaml > /tmp/sa.yaml
+          grep -qE '^  annotations:' /tmp/sa.yaml
+          if grep -qE '^annotations:' /tmp/sa.yaml; then
+            echo "ServiceAccount annotations must be under metadata, not top-level"; exit 1
+          fi
+
+      - name: Validate SeaweedFS filer-backed IAM (enableAuth=false + s3Seed hook)
+        run: |
+          # Default: gateway is filer-backed (no static -config) and the s3Seed hook renders.
+          helm template helm/openmrs --generate-name \
+            --set seaweedfs.enabled=true > /tmp/sw-default.yaml
+          grep -q 'seaweedfs-s3-seed' /tmp/sw-default.yaml
+          grep -q 'primary-admin' /tmp/sw-default.yaml
+          # The primary identity must be bucket-scoped, NOT cluster-admin (else the primary can
+          # read/write every tenant bucket). Assert the grant, not just the name - a name-only
+          # grep passes whether the actions are Read/Write/List or Admin.
+          grep -q '\-actions Read:%s,Write:%s,List:%s' /tmp/sw-default.yaml
+          if grep -q '\-actions Admin' /tmp/sw-default.yaml; then
+            echo "the primary identity must be bucket-scoped, not Admin"; exit 1
+          fi
+          if grep -q '\-config=/etc/sw' /tmp/sw-default.yaml; then
+            echo "expected filer-backed gateway (no static -config) by default"; exit 1
+          fi
+          # Seed uses its OWN creds Secret, so it works with only the top-level
+          # seaweedfs.enabled flag (backend wiring off) - no dependency on the backend
+          # Secret's storage.s3.* keys.
+          grep -q 'seaweedfs-s3-seed-creds' /tmp/sw-default.yaml
+          # seaweedfs disabled -> no seed hook
+          helm template helm/openmrs --generate-name \
+            --set seaweedfs.enabled=false > /tmp/sw-off.yaml
+          if grep -q 's3-seed' /tmp/sw-off.yaml; then
+            echo "seed hook must not render when seaweedfs is disabled"; exit 1
+          fi
+          # Reverting to static -config (enableAuth=true) must NOT render the seed hook,
+          # and the gateway must carry the static -config flag.
+          helm template helm/openmrs --generate-name \
+            --set seaweedfs.enabled=true --set seaweedfs.s3.enableAuth=true > /tmp/sw-static.yaml
+          if grep -q 's3-seed' /tmp/sw-static.yaml; then
+            echo "seed hook must not render when enableAuth=true"; exit 1
+          fi
+          grep -q '\-config=/etc/sw' /tmp/sw-static.yaml
+          # Guard: filer-backed (enableAuth=false) with the seed disabled would leave the
+          # gateway permanently open (no identity ever seeded) - must fail the render.
+          if err=$(helm template helm/openmrs --generate-name \
+              --set seaweedfs.enabled=true --set s3Seed.enabled=false 2>&1); then
+            echo "expected a fail when enableAuth=false and s3Seed.enabled=false"; exit 1
+          fi
+          grep -qF 'permanently open to anonymous access' <<<"$err"
+          # Admin key feeds the s3Seed shell: empty (dig fills only an absent key), whitespace,
+          # and leading '-' must all fail.
+          # Grep the message, not just the exit code: the charset guard also rejects an empty
+          # key, so exit-code-only would pass even if the non-empty guard were gone.
+          if err=$(helm template helm/openmrs --generate-name --set seaweedfs.enabled=true \
+              --set-string openmrs-backend.seaweedfs.s3.credentials.admin.accessKey= 2>&1); then
+            echo "empty admin accessKey must be rejected when s3Seed is enabled"; exit 1
+          fi
+          grep -qF 'must be non-empty' <<<"$err"
+          if err=$(helm template helm/openmrs --generate-name --set seaweedfs.enabled=true \
+              --set-string 'openmrs-backend.seaweedfs.s3.credentials.admin.secretKey=bad pass' 2>&1); then
+            echo "admin secretKey with whitespace must be rejected"; exit 1
+          fi
+          grep -qF 'may only contain' <<<"$err"
+          # Seed Job deadline defaults to 240s (raised for the cold-start race) and is overridable.
+          grep -qE 'activeDeadlineSeconds: 240' /tmp/sw-default.yaml
+          helm template helm/openmrs --generate-name --set seaweedfs.enabled=true \
+            --set s3Seed.activeDeadlineSeconds=300 | grep -qE 'activeDeadlineSeconds: 300'
 
 

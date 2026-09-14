@@ -1,7 +1,7 @@
 dependencies:
 - name: openmrs-backend
   repository: file://../openmrs-backend
-  version: 2.3.0
+  version: 2.4.0
 - name: openmrs-frontend
   repository: file://../openmrs-frontend
   version: 2.2.0
@@ -20,5 +20,5 @@ dependencies:
 - name: eck-elasticsearch
   repository: https://helm.elastic.co
   version: 0.19.0
-digest: sha256:e27cc8337b6ae8b4f6b3293682d8596b09d8ec4f4abe3e8e80d152f499077a45
-generated: "2026-08-28T00:17:17.891929531+03:00"
+digest: sha256:764ec98804594bd208045e882ec9615b78a244df96a56484cedc103225b45d8d
+generated: "2026-09-11T11:41:51.122188577+03:00"
