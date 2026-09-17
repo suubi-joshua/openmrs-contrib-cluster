@@ -1,0 +1,65 @@
+{{- if .Values.s3Bootstrap.enabled }}
+{{- $s3 := (index .Values "openmrs-backend").seaweedfs.s3 -}}
+{{- /*
+Post-install/upgrade hook: creates the tenant's bucket + a bucket-scoped identity
+(Read/Write/List:<bucket>) on the shared SeaweedFS. Idempotent, safe to re-run.
+NOTE: weed-shell command names/flags vary across SeaweedFS releases - verify against
+the deployed version before relying on this in production.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-s3-bootstrap
+  labels:
+    {{- include "openmrs-tenant.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.s3Bootstrap.backoffLimit | default 6 }}
+  # weed shell hangs forever on an unresolvable master; bound it (below the helm --timeout)
+  # so the Job fails with its own error instead of hanging until helm times out.
+  activeDeadlineSeconds: {{ .Values.s3Bootstrap.activeDeadlineSeconds | default 240 }}
+  template:
+    metadata:
+      labels:
+        {{- include "openmrs-tenant.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: s3-bootstrap
+          image: {{ .Values.s3Bootstrap.image | quote }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              printf 's3.bucket.create -name %s\ns3.configure -user %s -access_key %s -secret_key %s -actions Read:%s,Write:%s,List:%s -apply\n' \
+                "$BUCKET" "$USER" "$ACCESS_KEY" "$SECRET_KEY" "$BUCKET" "$BUCKET" "$BUCKET" \
+                | weed shell -master "$MASTER"
+              # weed shell's exit code does not reflect per-command success, so verify.
+              # Match the quoted identity name / exact bucket field so a prefix tenant
+              # (e.g. "coast" vs "coastal") can't cross-match.
+              printf 's3.configure -apply=false\n' | weed shell -master "$MASTER" | grep -qF "\"$USER\"" \
+                || { echo "s3Bootstrap FAILED: identity $USER not present in filer IAM after apply"; exit 1; }
+              printf 's3.bucket.list\n' | weed shell -master "$MASTER" | awk '{print $1}' | grep -qxF "$BUCKET" \
+                || { echo "s3Bootstrap FAILED: bucket $BUCKET not created"; exit 1; }
+              echo "s3Bootstrap OK: identity $USER and bucket $BUCKET present"
+          env:
+            - name: MASTER
+              value: {{ .Values.s3Bootstrap.master | quote }}
+            - name: USER
+              value: {{ include "openmrs-tenant.normalizedTenant" . | quote }}
+            - name: BUCKET
+              value: {{ $s3.bucketName | quote }}
+            - name: ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-s3-credentials
+                  key: accessKey
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-s3-credentials
+                  key: secretKey
+{{- end }}

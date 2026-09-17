@@ -29,6 +29,9 @@ image:
 infinispan:
   clustered: false
   bind_port: 7800
+  # JVM DNS cache TTL (seconds), applied only when clustered, so JGroups DNS_PING
+  # re-resolves pods on scale instead of waiting out the JVM's ~30s default.
+  dnsCacheTtlSeconds: 5
 
 db:
   hostname: mariadb
@@ -104,7 +107,10 @@ traefikService:
   enabled: false
   sticky:
     cookie:
-      secure: false
+      # Override per tenant, e.g. openmrs_session_<tenant>, to avoid collisions on a shared gateway.
+      name: "openmrs_session"
+      # Set false for plain-HTTP setups (e.g. multi-replica on Kind), or the browser drops the cookie.
+      secure: true
 
 ingress:
   enabled: false
@@ -206,11 +212,22 @@ seaweedfs:
   s3:
     # Empty = this release's own in-cluster SeaweedFS; a tenant sharing the primary's
     # points here (e.g. http://openmrs-seaweedfs-s3.openmrs.svc.cluster.local:8333).
+    # Point at managed S3 (e.g. https://s3.us-east-2.amazonaws.com) to swap the store.
     endpoint: ""
-    # Shared across releases under admin creds - tenants sharing one SeaweedFS MUST
-    # each set a distinct, pre-created bucket or they overwrite each other's files.
+    # Each release MUST use a distinct bucket - tenants sharing one SeaweedFS
+    # otherwise overwrite each other's files.
     bucketName: "openmrs"
+    # AWS region for the S3 client. Match the managed-S3 region when swapping stores.
+    region: "us-east-2"
+    # "true" for SeaweedFS/MinIO (path-style); "false" for managed AWS S3
+    # (virtual-hosted style). String, not bool.
+    forcePathStyle: "true"
     credentials:
+      # A tenant's bucket-scoped key; empty falls back to admin below. Blank these AND
+      # admin.accessKey/.secretKey to emit no static keys, so the AWS SDK default
+      # credential chain (IRSA) applies.
+      accessKey: ""
+      secretKey: ""
       admin:
         accessKey: "openmrs"
         secretKey: "OpenMRS123"

@@ -9,6 +9,12 @@ defaults (host "mariadb", db "openmrs") and only fails at runtime.
 {{- if or (not $db.url) (not $db.hostname) (not $db.username) (not $db.password) -}}
 {{- fail "openmrs-tenant: openmrs-backend.db.url, .hostname, .username and .password are all required. See the README's \"Deploy additional tenants\" section." -}}
 {{- end -}}
+{{- /* Both - and _ normalize to _ in the tenant's DB user AND SeaweedFS identity names, so
+     east-coast and east_coast would collide on one shared account/identity. Fire whenever the
+     normalized name provisions something (dbBootstrap or s3Bootstrap), not just for the DB. */ -}}
+{{- if and (or .Values.dbBootstrap.enabled .Values.s3Bootstrap.enabled) (contains "_" (.Values.global.tenant.name | toString)) -}}
+{{- fail "openmrs-tenant: global.tenant.name must not contain underscores while dbBootstrap.enabled or s3Bootstrap.enabled — both - and _ normalize to _ in the tenant's DB user and SeaweedFS identity, so east-coast and east_coast would collide on the same account/identity. Use hyphens only, or disable both bootstrap jobs and provision manually." -}}
+{{- end -}}
 {{- if .Values.dbBootstrap.enabled -}}
 {{- /*
 Why the guard: the MariaDB operator (26.6.0) builds SQL from CR fields without
@@ -16,11 +22,10 @@ escaping ' or \, so those chars would leave a User/Grant CR stuck in Error.
 CRD presence can't be checked at render time (helm template runs without a
 cluster), so a missing operator is a documented README prerequisite.
 */}}
-{{- if contains "_" (.Values.global.tenant.name | toString) -}}
-{{- fail "openmrs-tenant: global.tenant.name must not contain underscores while dbBootstrap.enabled=true — both - and _ normalize to _ in the database/user names, so tenants east-coast and east_coast would collide on the same MariaDB account. Use hyphens only or set dbBootstrap.enabled=false." -}}
-{{- end -}}
 {{- $dbName := include "openmrs-tenant.dbName" . -}}
 {{- $normalizedTenant := include "openmrs-tenant.normalizedTenant" . -}}
+{{- /* TODO: tighten to an exact openmrs_<tenant> match - this contains check lets a prefix
+     tenant claim a longer tenant's db (e.g. "east" passing openmrs_east_coast). */ -}}
 {{- if not (contains $normalizedTenant $dbName) -}}
 {{- fail (printf "openmrs-tenant: dbBootstrap.database (%s) must contain the tenant name (%s). Use the default or set dbBootstrap.enabled=false." $dbName $normalizedTenant) -}}
 {{- end -}}
@@ -42,7 +47,7 @@ cluster), so a missing operator is a documented README prerequisite.
 {{- fail (printf "openmrs-tenant: openmrs-backend.db.url must target the same database dbBootstrap provisions (%s); the URL's database segment is %s. Fix the JDBC URL or dbBootstrap.database." $dbName $urlDb) -}}
 {{- end -}}
 {{- end -}}
-{{- /* Phase 3: routing guard — host-scoped HTTPRoutes must not collide. */ -}}
+{{- /* Routing guard: host-scoped HTTPRoutes must not collide. */ -}}
 {{- $beGw := (index .Values "openmrs-backend").gateway | default dict -}}
 {{- $feGw := (index .Values "openmrs-frontend").gateway | default dict -}}
 {{- if and (dig "enabled" false $beGw) (not (dig "hostnames" nil $beGw)) -}}
@@ -62,5 +67,71 @@ cluster), so a missing operator is a documented README prerequisite.
 {{- if not (has $h $beHosts) -}}
 {{- fail (printf "openmrs-tenant: %s serves the tenant SPA but openmrs-backend.gateway does not route it, so the SPA's relative apiUrl (%s) would reach the primary backend instead. Add %s to openmrs-backend.gateway.hostnames with openmrs-backend.gateway.enabled=true, or set an absolute openmrs-frontend.apiUrl." $h $apiUrl $h) -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /* Storage guards for a scaled tenant sharing the primary's SeaweedFS. */ -}}
+{{- $be := index .Values "openmrs-backend" -}}
+{{- $sw := $be.seaweedfs | default dict -}}
+{{- $s3 := $sw.s3 | default dict -}}
+{{- if $sw.enabled -}}
+{{- if not (dig "endpoint" "" $s3) -}}
+{{- fail "openmrs-tenant: openmrs-backend.seaweedfs.enabled=true requires openmrs-backend.seaweedfs.s3.endpoint - a tenant has no SeaweedFS of its own, so point it at the primary's S3 (e.g. http://openmrs-seaweedfs-s3.openmrs.svc.cluster.local:8333)." -}}
+{{- end -}}
+{{- $bkt := dig "bucketName" "" $s3 -}}
+{{- if not $bkt -}}
+{{- fail "openmrs-tenant: openmrs-backend.seaweedfs.enabled=true requires a distinct openmrs-backend.seaweedfs.s3.bucketName per tenant, or tenants overwrite each other's files on the shared store." -}}
+{{- end -}}
+{{- /* S3 bucket names must be DNS-compliant; openmrs_<tenant> (underscores) is rejected by S3 as InvalidBucketName. */ -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$" ($bkt | toString)) -}}
+{{- fail (printf "openmrs-tenant: openmrs-backend.seaweedfs.s3.bucketName (%s) is not a valid S3 bucket name - use lowercase letters, digits and hyphens, 3-63 chars, no underscores. Note the DB-style name openmrs_<tenant> is INVALID for S3; use openmrs-<tenant>." $bkt) -}}
+{{- end -}}
+{{- $useDefaultChain := eq (dig "credentials" "useDefaultChain" false $s3 | toString) "true" -}}
+{{- $ak := dig "credentials" "accessKey" "" $s3 -}}
+{{- $sk := dig "credentials" "secretKey" "" $s3 -}}
+{{- if $useDefaultChain -}}
+{{- /* useDefaultChain means no static keys (managed S3 / IRSA); a static key or s3Bootstrap contradicts it. */ -}}
+{{- if or $ak $sk -}}
+{{- fail "openmrs-tenant: openmrs-backend.seaweedfs.s3.credentials.useDefaultChain=true means no static keys, but accessKey/.secretKey is set. Unset them, or set useDefaultChain=false to use the static key." -}}
+{{- end -}}
+{{- if .Values.s3Bootstrap.enabled -}}
+{{- fail "openmrs-tenant: useDefaultChain=true (no static keys) is incompatible with s3Bootstrap.enabled, which provisions and requires a bucket-scoped key. Disable one." -}}
+{{- end -}}
+{{- else -}}
+{{- /* Require a bucket-scoped key: without it the backend falls back to the shared
+       credentials.admin.* (the primary's own credential, or none), not a key scoped to this
+       tenant's bucket. Set useDefaultChain=true for managed S3 (default chain). */ -}}
+{{- if or (not $ak) (not $sk) -}}
+{{- fail "openmrs-tenant: openmrs-backend.seaweedfs.enabled=true requires a bucket-scoped openmrs-backend.seaweedfs.s3.credentials.accessKey and .secretKey - without them the tenant has no key of its own and falls back to the shared credentials.admin.* (blanked by default, otherwise the primary's own credential), not a key scoped to this tenant's bucket. For managed S3 with IRSA/instance credentials (no static keys), set openmrs-backend.seaweedfs.s3.credentials.useDefaultChain=true." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.s3Bootstrap.enabled -}}
+{{- if not $sw.enabled -}}
+{{- fail "openmrs-tenant: s3Bootstrap.enabled=true only applies with openmrs-backend.seaweedfs.enabled=true (it provisions the tenant's bucket-scoped identity on the shared SeaweedFS)." -}}
+{{- end -}}
+{{- /* Injection guard: s3Bootstrap pipes these keys into a `weed shell` command (whitespace-
+       tokenized), so a space or leading '-' could inject flags (e.g. -actions Admin). Only gated
+       here: without s3Bootstrap the keys reach a Secret only, and managed-S3 keys (MinIO/Wasabi)
+       may legitimately contain other characters. */ -}}
+{{- $keyRe := "^[A-Za-z0-9/+=_.@-]+$" -}}
+{{- $bootAk := dig "credentials" "accessKey" "" $s3 -}}
+{{- $bootSk := dig "credentials" "secretKey" "" $s3 -}}
+{{- if or (not (regexMatch $keyRe ($bootAk | toString))) (hasPrefix "-" ($bootAk | toString)) -}}
+{{- fail "openmrs-tenant: openmrs-backend.seaweedfs.s3.credentials.accessKey may only contain [A-Za-z0-9/+=_.@-] and must not start with '-' - it is passed to the SeaweedFS provisioning shell as a command token." -}}
+{{- end -}}
+{{- if or (not (regexMatch $keyRe ($bootSk | toString))) (hasPrefix "-" ($bootSk | toString)) -}}
+{{- fail "openmrs-tenant: openmrs-backend.seaweedfs.s3.credentials.secretKey may only contain [A-Za-z0-9/+=_.@-] and must not start with '-' - it is passed to the SeaweedFS provisioning shell as a command token." -}}
+{{- end -}}
+{{- /* Bind both provisioned identifiers to the tenant, like the DB guards above: s3Bootstrap
+       mints a real Read/Write/List grant from bucketName, and SeaweedFS keys identities by name
+       only, so it accepts a duplicate access key without complaint. */ -}}
+{{- $tn := .Values.global.tenant.name | toString | lower -}}
+{{- $bootBkt := dig "bucketName" "" $s3 -}}
+{{- $wantBkt := printf "openmrs-%s" $tn -}}
+{{- if ne ($bootBkt | toString) $wantBkt -}}
+{{- fail (printf "openmrs-tenant: openmrs-backend.seaweedfs.s3.bucketName (%s) must be exactly %s while s3Bootstrap.enabled=true - s3Bootstrap grants this tenant's key Read/Write/List on that bucket, and a merely tenant-containing name lets a tenant claim a longer tenant's bucket (east could take openmrs-east-coast). Use %s, or set s3Bootstrap.enabled=false and provision the identity manually." $bootBkt $wantBkt $wantBkt) -}}
+{{- end -}}
+{{- if not (contains $tn ($bootAk | toString | lower)) -}}
+{{- fail (printf "openmrs-tenant: openmrs-backend.seaweedfs.s3.credentials.accessKey must contain the tenant name (%s) while s3Bootstrap.enabled=true - SeaweedFS does not reject a duplicate access key, so reusing the primary's or another tenant's key makes the two identities collide non-deterministically." $tn) -}}
 {{- end -}}
 {{- end -}}

@@ -14,7 +14,7 @@ spec:
         weight: 1
         sticky:
           cookie:
-            name: openmrs_session
-            secure: {{ .Values.traefikService.sticky.cookie.secure | default false }}
+            name: {{ .Values.traefikService.sticky.cookie.name | default "openmrs_session" }}
+            secure: {{ if kindIs "invalid" .Values.traefikService.sticky.cookie.secure }}true{{ else }}{{ .Values.traefikService.sticky.cookie.secure }}{{ end }}
             httpOnly: true
 {{- end }}

@@ -16,7 +16,7 @@ umbrella the endpoint defaults to the release's own SeaweedFS, but a tenant depl
 none of its own - so a tenant must also point seaweedfs.s3.endpoint at the primary's,
 or it satisfies this guard with storage aimed at a non-existent service. */}}
 {{- $hint := "" -}}
-{{- if not .Values.seaweedfs.enabled -}}{{- $hint = " (For a tenant sharing the primary's SeaweedFS, also set seaweedfs.s3.endpoint to the primary's S3 AND a distinct, pre-created seaweedfs.s3.bucketName - all releases otherwise share the 'openmrs' bucket under admin creds and would read/overwrite each other's files.)" -}}{{- end -}}
+{{- if not .Values.seaweedfs.enabled -}}{{- $hint = " (For a tenant sharing the primary's SeaweedFS, also set seaweedfs.s3.endpoint to the primary's S3 AND a distinct, pre-created seaweedfs.s3.bucketName - all releases otherwise share the 'openmrs' bucket under the same primary credential and would read/overwrite each other's files.)" -}}{{- end -}}
 {{- fail (printf "openmrs-backend: running multiple replicas (autoscaling.enabled or replicaCount>1) also requires %s. Without them replicas disagree on cached state and stored files.%s See the README \"Scaling\" section." (join " and " $missing) $hint) -}}
 {{- end -}}
 {{- end -}}

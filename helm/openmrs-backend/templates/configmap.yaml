@@ -49,18 +49,18 @@ data:
   {{- end }}
   {{- if .Values.seaweedfs.enabled }}
   storage.type: "s3"
-  storage.s3.region: "us-east-2"
-  # endpoint/bucket overridable per release; a tenant sharing SeaweedFS needs its own
-  # bucket (see values.yaml seaweedfs.s3).
+  storage.s3.region: {{ .Values.seaweedfs.s3.region | default "us-east-2" | quote }}
   storage.s3.endpoint: {{ .Values.seaweedfs.s3.endpoint | default (include "openmrs-seaweedfs.s3url" .) }}
   storage.s3.bucketName: {{ .Values.seaweedfs.s3.bucketName | default "openmrs" | quote }}
-  storage.s3.forcePathStyle: "true"
+  storage.s3.forcePathStyle: {{ if kindIs "invalid" .Values.seaweedfs.s3.forcePathStyle }}"true"{{ else }}{{ .Values.seaweedfs.s3.forcePathStyle | toString | quote }}{{ end }}
   {{- end }}
   {{- if .Values.infinispan.clustered }}
   cache.type: "cluster"
   cache.stack: "kubernetes"
   jgroups.dns.query: '{{ include "openmrs-backend.headlessServiceName" . }}.{{ .Release.Namespace }}.svc.cluster.local'
   jgroups.bind.port: {{ .Values.infinispan.bind_port | quote }}
+  # Separate env var (not JAVA_TOOL_OPTIONS) so it composes with the search config's.
+  _JAVA_OPTIONS: "-Dsun.net.inetaddr.ttl={{ .Values.infinispan.dnsCacheTtlSeconds | default 5 }}"
   {{- else }}
   cache.type: "local"
   {{- end }}

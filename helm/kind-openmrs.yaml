@@ -20,6 +20,12 @@ openmrs-backend:
       namespace: openmrs-system
   infinispan:
     clustered: true
+  traefikService:
+    sticky:
+      cookie:
+        # Kind serves plain HTTP; a Secure cookie is dropped by the browser and
+        # breaks sticky sessions across replicas. Production (HTTPS) keeps default true.
+        secure: false
   # Workload wiring only: the backend pod/secret/routes read these to enable
   # S3 storage, the Elasticsearch volume + wait loop and the SeaweedFS admin route.
   # The infra itself is deployed by the umbrella deps below.
@@ -122,11 +128,9 @@ seaweedfs:
   s3:
     enabled: true
     replicas: 2
-    enableAuth: true
-    credentials:
-      admin:
-        accessKey: "openmrs"
-        secretKey: "OpenMRS123"
+    # Filer-backed dynamic IAM: the s3Seed hook seeds the primary's bucket-scoped identity; per-tenant
+    # identities are added at runtime and hot-reloaded (see umbrella values.yaml).
+    enableAuth: false
     createBuckets:
       - name: openmrs
 

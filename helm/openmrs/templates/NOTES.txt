@@ -35,6 +35,25 @@
 {{- if and $sw.admin.enabled (not $.Values.seaweedfs.admin.enabled) }}
 {{- fail "openmrs-backend.seaweedfs.admin.enabled only wires the workload's own route in 2.0.0; set seaweedfs.admin.enabled=true to deploy the SeaweedFS Admin component, see README.md" }}
 {{- end }}
+{{/* enableAuth=false only enforces once an identity exists in the filer; with s3Seed off,
+     nothing ever seeds one and the gateway stays permanently open - fail instead. */}}
+{{- if and $.Values.seaweedfs.enabled $.Values.seaweedfs.s3.enabled (not $.Values.seaweedfs.s3.enableAuth) (not (default (dict) $.Values.s3Seed).enabled) }}
+{{- fail "seaweedfs.s3.enableAuth=false with s3Seed.enabled=false leaves the S3 gateway with no identities and permanently open to anonymous access. Enable s3Seed to seed the primary's identity, or set seaweedfs.s3.enableAuth=true." }}
+{{- end }}
+{{/* Admin key goes into the s3Seed `weed shell` command: require non-empty (dig's default only
+     fills an absent key) and restrict the charset, like the tenant guards. */}}
+{{- if and $.Values.seaweedfs.enabled $.Values.seaweedfs.s3.enabled (not $.Values.seaweedfs.s3.enableAuth) (default (dict) $.Values.s3Seed).enabled }}
+{{- $beVals := index $.Values "openmrs-backend" }}
+{{- $adminAk := dig "seaweedfs" "s3" "credentials" "admin" "accessKey" "openmrs" $beVals }}
+{{- $adminSk := dig "seaweedfs" "s3" "credentials" "admin" "secretKey" "OpenMRS123" $beVals }}
+{{- if or (not $adminAk) (not $adminSk) }}
+{{- fail "openmrs-backend.seaweedfs.s3.credentials.admin.accessKey and .secretKey must be non-empty when s3Seed is enabled - they seed the primary's bucket-scoped identity the backend authenticates with." }}
+{{- end }}
+{{- $keyRe := "^[A-Za-z0-9/+=_.@-]+$" }}
+{{- if or (not (regexMatch $keyRe ($adminAk | toString))) (hasPrefix "-" ($adminAk | toString)) (not (regexMatch $keyRe ($adminSk | toString))) (hasPrefix "-" ($adminSk | toString)) }}
+{{- fail "openmrs-backend.seaweedfs.s3.credentials.admin.accessKey/.secretKey may only contain [A-Za-z0-9/+=_.@-] and must not start with '-' - they are passed to the SeaweedFS s3Seed shell as command tokens." }}
+{{- end }}
+{{- end }}
 OpenMRS is ready!
 
   http://localhost:8080/openmrs/
